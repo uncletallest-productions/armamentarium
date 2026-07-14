@@ -1,0 +1,10 @@
+{
+  "_comment": "Copy to ~/.config/armamentarium/router.json (or point $ARMAMENTARIUM_ROUTER_CONFIG at it). The 'roots' list is the security boundary: the router serves ONLY paths under these roots, and writes ONLY under roots with access 'rw'. Paths resolve '~' and symlinks before the allowlist check.",
+  "roots": [
+    { "path": "~/Datasets/Substrate", "access": "rw" },
+    { "path": "~/Datasets/Scriptorum", "access": "rw" },
+    { "path": "~/.config/Claude/local-agent-mode-sessions", "access": "rw" },
+    { "path": "~/Datasets/Gastronomicum", "access": "r" }
+  ],
+  "backends": ["local"]
+}
