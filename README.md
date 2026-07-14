@@ -38,9 +38,33 @@ Two capabilities, one tool:
 
 ## Install
 
+**Recommended: install into a venv.** On Debian/Ubuntu (and anything following
+PEP 668, "externally-managed-environment"), installing into the system Python
+with `pip --break-system-packages` drops these dependencies into the same
+site-packages `apt` manages — which can break apt-managed Python tools like
+`nala` that pin their own versions of shared libs (e.g. `anyio`). A venv keeps
+armamentarium's dependency tree fully isolated, so it never fights the system:
+
 ```bash
-pip install -e .        # from this directory
+python3 -m venv ~/.venvs/armamentarium
+~/.venvs/armamentarium/bin/pip install -e /path/to/armamentarium
 ```
+
+Then invoke the server by its venv-absolute path (see Run), which also avoids
+any `~/.local/bin`-not-on-PATH surprises.
+
+<details>
+<summary>System install (not recommended)</summary>
+
+```bash
+pip install -e .        # from this directory; on PEP 668 systems needs --break-system-packages
+```
+
+If this leaves an apt tool complaining about `anyio` (e.g. `nala` wanting
+`>=4.9`), restore it with `pip install --break-system-packages -U 'anyio>=4.9,<5'`
+— mcp only requires `anyio>=4.5`, so that satisfies both. The venv route avoids
+the whole problem.
+</details>
 
 ## Configure (the security boundary)
 
@@ -63,13 +87,31 @@ Config is found via, in order: `$ARMAMENTARIUM_ROUTER_CONFIG`, then
 ## Run
 
 ```bash
+# venv install (recommended) — absolute path, no PATH setup needed:
+~/.venvs/armamentarium/bin/armamentarium-fs
+
+# or, from an activated venv / system install:
 armamentarium-fs
 # or:
 python -m armamentarium.mcp_router.server
 ```
 
 It's a local **stdio** MCP server. Point your MCP client's server config at that
-command. `arma_router_status` reports the loaded roots and backends.
+command (for a venv install, use the venv-absolute path above). `arma_router_status`
+reports the loaded roots and backends.
+
+Example MCP client server entry:
+
+```json
+{
+  "mcpServers": {
+    "armamentarium": {
+      "command": "/home/youruser/.venvs/armamentarium/bin/armamentarium-fs",
+      "env": { "ARMAMENTARIUM_ROUTER_CONFIG": "/home/youruser/.config/armamentarium/router.json" }
+    }
+  }
+}
+```
 
 ## Tools
 
