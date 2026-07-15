@@ -144,6 +144,13 @@ def discover_local(account: Optional[str], device: Optional[str]) -> Tuple[str, 
     return account, device
 
 
+def local_device_dir(account: Optional[str] = None, device: Optional[str] = None) -> Path:
+    """The live device session dir on this machine — where docked sessions live
+    (i.e. the undock candidates)."""
+    acct, dev = discover_local(account, device)
+    return LOCAL_ROOT / acct / dev
+
+
 # ------------------------------------------------------------------------------- plan
 
 @dataclass

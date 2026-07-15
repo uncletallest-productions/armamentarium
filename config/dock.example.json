@@ -6,5 +6,6 @@
   },
   "source_dirs": [
     "~/Datasets/Substrate/dom0/sisyphus-archive/sessions"
-  ]
+  ],
+  "roaming_store": "~/Datasets/Substrate/dom0/session-roaming"
 }

@@ -181,6 +181,38 @@ armamentarium dock <session-dir> --apply --restart
 
 Stop is a graceful `SIGTERM` with a timeout; add `--force` to `SIGKILL` if it won't exit.
 
+## Roaming between machines (`undock` + checkout ledger)
+
+To move a session to another machine *properly* — without the corruption risk of having
+it open in two places — armamentarium coordinates through a **shared checkout ledger on
+Substrate** (reachable by every node over NFS, LAN or tailnet; not mDNS, which is
+link-local). Configure `roaming_store` in dock.json (defaults to
+`~/Datasets/Substrate/dom0/session-roaming`).
+
+The loop:
+
+```bash
+# On machine A, hand the session off:
+armamentarium undock <local-session-dir> --remove-local   # flush to store, release, clear local
+
+# On machine B, take it:
+armamentarium dock <store>/<account>/store/local_<uuid> --apply --restart
+```
+
+`dock --apply` **acquires** a checkout and refuses if another machine holds the session
+live (`--force` to override — only if you're sure it isn't in use). `undock` **releases**
+it. Inspect or hand-edit the ledger:
+
+```bash
+armamentarium roaming status                 # who holds what, where
+armamentarium roaming checkin  local_<uuid>  # force-release (e.g. a crashed machine's hold)
+armamentarium roaming checkout local_<uuid>  # manually claim
+```
+
+The ledger is best-effort in `dock`: if the store isn't present, it's skipped so `dock`
+still works standalone. On a cloned-config fleet (shared deviceUUID + identical mount
+paths) undock↔dock is mostly a file sync — the ledger is the only added machinery.
+
 ## Claude Desktop control (`armamentarium desktop`)
 
 Optional, config-driven, and thin — armamentarium's core needs none of it. Configure
@@ -204,8 +236,9 @@ to confirm your install is detected before relying on `stop`/`restart`.
 armamentarium/
   armamentarium/
     __init__.py
-    cli.py           # `armamentarium dock ... / desktop ...` entry point
-    dock.py          # session dock: discover local device, plan, rewrite, apply
+    cli.py           # `armamentarium dock/undock/roaming/desktop/list/router ...` entry
+    dock.py          # session dock: discover local device, plan, rewrite, apply; session scan
+    roaming.py       # checkout ledger + undock (cross-machine coordination on Substrate)
     desktop.py       # optional config-driven Claude Desktop process control
     mcp_router/
       __init__.py
@@ -226,8 +259,10 @@ Prototype (v0.1.0). Router implemented and self-tested. Chat-session roaming
 (`armamentarium dock`) implemented and verified end-to-end: a real archived session
 docked onto another machine opens in Claude Desktop with full history and its folder
 reconnected. Runs host-side (the session tree it targets can't be reached from inside a
-sandboxed client — the gap the router closes). Remaining: scheduled-task portability
-(separate mechanism), `undock`/sync-back, remote router backends.
+sandboxed client — the gap the router closes). Cross-machine roaming — `undock` +
+checkout ledger — implemented and self-tested (checkout/hold-refusal/release/flush).
+Remaining: scheduled-task portability (separate mechanism), Avahi presence + auto
+stale-lock detection, remote router backends.
 
 ## License
 

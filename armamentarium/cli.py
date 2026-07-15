@@ -54,6 +54,14 @@ def cmd_dock(args: argparse.Namespace) -> int:
             print("note: --restart has no effect without --apply.")
         return 0
 
+    # Ledger guard: refuse if another machine holds this session live (best-effort —
+    # skipped cleanly if the roaming store isn't present). Records holder=this host.
+    from . import roaming
+    ok, note = roaming.try_checkout(plan.session_id, force=args.force, account=args.account)
+    if not ok:
+        print(f"error: {note}", file=sys.stderr)
+        return 2
+
     # With --restart: stop Desktop first so we never write under a live app,
     # then apply, then start it back up so it re-scans the session tree.
     cfg = None
@@ -73,6 +81,7 @@ def cmd_dock(args: argparse.Namespace) -> int:
         return 2
     print("DOCKED.")
     print(json.dumps(result, indent=2))
+    print(f"ledger: {note}")
     print(f"\nundo: {result['cleanup']}")
 
     if args.restart and cfg is not None:
@@ -86,12 +95,32 @@ def cmd_dock(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    from .dock import load_source_dirs, scan_sessions
-    dirs = [args.dir] if args.dir else load_source_dirs()
+    from .dock import load_source_dirs, scan_sessions, local_device_dir
+    if args.local:
+        try:
+            dirs = [str(local_device_dir(account=args.account))]
+        except DockError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+    else:
+        from . import roaming
+        # Scan the roaming store FIRST (freshest undocked copies win dedup), then source_dirs.
+        store = roaming.store_sessions_dir(account=args.account)
+        base_dirs = [args.dir] if args.dir else load_source_dirs()
+        dirs = ([str(store)] if store else []) + base_dirs
     if not dirs:
         print("error: no source dir given and no 'source_dirs' in dock.json", file=sys.stderr)
         return 2
     sessions = scan_sessions(dirs)
+    if not args.local:
+        # annotate ledger holder so callers can flag sessions checked out elsewhere
+        from . import roaming
+        hold = roaming.holders(account=args.account)
+        me = roaming.machine_id()
+        for s in sessions:
+            h = hold.get(s["session_id"])
+            s["held_by"] = h
+            s["held_by_other"] = bool(h and h != me)
     if args.json:
         print(json.dumps(sessions, indent=2))
         return 0
@@ -103,6 +132,52 @@ def cmd_list(args: argparse.Namespace) -> int:
         dk = "docked" if s["docked"] else ("new" if s["docked"] is False else "?")
         print(f"[{kind}] {dk:6} {s['session_id']}  {s['title']!r}  {s['folders']}")
     return 0
+
+
+def cmd_undock(args: argparse.Namespace) -> int:
+    from . import roaming
+    # --restart: stop Desktop → flush+release(+remove) → start, so we snapshot a quiescent
+    # session and never delete under a live app.
+    cfg = None
+    if args.restart:
+        try:
+            cfg = desktop_mod.load_desktop_config()
+            print("stopping Claude Desktop ...")
+            print("  " + json.dumps(desktop_mod.stop(cfg, force=args.force)))
+        except DesktopError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+    try:
+        result = roaming.undock(args.session, remove_local=args.remove_local, account=args.account)
+    except (roaming.RoamingError, DockError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print("UNDOCKED.")
+    print(json.dumps(result, indent=2))
+    if args.restart and cfg is not None:
+        try:
+            print("starting Claude Desktop ...")
+            print("  " + json.dumps(desktop_mod.start(cfg)))
+        except DesktopError as e:
+            print(f"warning: undock succeeded but restart failed: {e}", file=sys.stderr)
+            return 1
+    return 0
+
+
+def cmd_roaming(args: argparse.Namespace) -> int:
+    from . import roaming
+    try:
+        if args.roaming_cmd == "status":
+            print(json.dumps(roaming.status(account=args.account), indent=2))
+        elif args.roaming_cmd == "checkout":
+            print(json.dumps(roaming.checkout(args.session_id, force=args.force, account=args.account), indent=2))
+        elif args.roaming_cmd == "checkin":
+            prev = roaming.checkin(args.session_id, account=args.account)
+            print(json.dumps({"released": args.session_id, "was_held_by": (prev or {}).get("machine")}, indent=2))
+        return 0
+    except (roaming.RoamingError, DockError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
 
 def cmd_router(args: argparse.Namespace) -> int:
@@ -158,8 +233,33 @@ def build_parser() -> argparse.ArgumentParser:
     ds.add_argument("--force", action="store_true", help="SIGKILL if graceful SIGTERM times out (stop/restart)")
     ds.set_defaults(func=cmd_desktop)
 
+    ud = sub.add_parser("undock", help="flush a live session back to the shared store + release it")
+    ud.add_argument("session", help="path to the local 'local_<uuid>' session directory")
+    ud.add_argument("--remove-local", action="store_true", help="delete the local copy after flushing")
+    ud.add_argument("--restart", action="store_true", help="stop Desktop before, start after (needs desktop.json)")
+    ud.add_argument("--force", action="store_true", help="SIGKILL Desktop if graceful stop times out (with --restart)")
+    ud.add_argument("--account", help="account UUID override")
+    ud.set_defaults(func=cmd_undock)
+
+    rm = sub.add_parser("roaming", help="checkout ledger (cross-machine session coordination)")
+    rmsub = rm.add_subparsers(dest="roaming_cmd", required=True)
+    rmst = rmsub.add_parser("status", help="show the ledger (who holds what)")
+    rmst.add_argument("--account", help="account UUID override")
+    rmst.set_defaults(func=cmd_roaming)
+    rmco = rmsub.add_parser("checkout", help="manually mark a session held by this machine")
+    rmco.add_argument("session_id")
+    rmco.add_argument("--force", action="store_true", help="override another machine's hold")
+    rmco.add_argument("--account", help="account UUID override")
+    rmco.set_defaults(func=cmd_roaming)
+    rmci = rmsub.add_parser("checkin", help="release a session's checkout")
+    rmci.add_argument("session_id")
+    rmci.add_argument("--account", help="account UUID override")
+    rmci.set_defaults(func=cmd_roaming)
+
     ls = sub.add_parser("list", help="list dockable sessions from source dirs")
     ls.add_argument("dir", nargs="?", help="source dir (default: source_dirs from dock.json)")
+    ls.add_argument("--local", action="store_true", help="list sessions docked on THIS machine (undock candidates)")
+    ls.add_argument("--account", help="account UUID override (with --local)")
     ls.add_argument("--json", action="store_true", help="machine-readable output")
     ls.set_defaults(func=cmd_list)
 
