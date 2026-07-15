@@ -144,6 +144,13 @@ mkdir -p ~/.config/armamentarium
 cp config/dock.example.json ~/.config/armamentarium/dock.json   # edit for your migrations
 ```
 
+List what's dockable (from `source_dirs` in dock.json, or a given dir):
+
+```bash
+armamentarium list                     # source_dirs from dock.json
+armamentarium list <dir> --json        # scan a dir, machine-readable
+```
+
 Dry-run by default (prints a plan, writes nothing):
 
 ```bash

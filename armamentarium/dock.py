@@ -43,18 +43,72 @@ class DockError(Exception):
 
 # ----------------------------------------------------------------------------- config
 
+def _read_dock_config() -> dict:
+    if not DOCK_CONFIG.exists():
+        return {}
+    try:
+        return json.loads(DOCK_CONFIG.read_text())
+    except json.JSONDecodeError as e:
+        raise DockError(f"{DOCK_CONFIG} is not valid JSON: {e}") from e
+
+
 def load_path_map(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Load the mount-root path map from config, overlaid with CLI --path-map entries."""
-    path_map: Dict[str, str] = {}
-    if DOCK_CONFIG.exists():
-        try:
-            data = json.loads(DOCK_CONFIG.read_text())
-        except json.JSONDecodeError as e:
-            raise DockError(f"{DOCK_CONFIG} is not valid JSON: {e}") from e
-        path_map.update(data.get("path_map", {}))
+    path_map: Dict[str, str] = dict(_read_dock_config().get("path_map", {}))
     if extra:
         path_map.update(extra)
     return path_map
+
+
+def load_source_dirs(extra: Optional[List[str]] = None) -> List[str]:
+    """Directories to scan for dockable sessions (`source_dirs` in dock.json + CLI extras)."""
+    dirs = list(_read_dock_config().get("source_dirs", []))
+    if extra:
+        dirs += extra
+    return [os.path.expanduser(d) for d in dirs]
+
+
+def scan_sessions(dirs: List[str], account: Optional[str] = None,
+                  device: Optional[str] = None) -> List[dict]:
+    """Enumerate `local_<uuid>` sessions under `dirs` with dock-relevant metadata.
+
+    Each entry: session_id, title, path, folders, scheduled (bool), docked
+    (True/False, or None if the local device tree couldn't be resolved).
+    """
+    local_dev = acct = None
+    try:
+        acct, local_dev = discover_local(account, device)
+    except DockError:
+        pass  # docked-status stays unknown
+
+    out: List[dict] = []
+    seen = set()
+    for d in dirs:
+        base = Path(d).expanduser()
+        if not base.is_dir():
+            continue
+        for sc in sorted(base.glob("local_*.json")):
+            sid = sc.name[:-len(".json")]
+            sess_dir = base / sid
+            if not sess_dir.is_dir() or sid in seen:
+                continue
+            seen.add(sid)
+            try:
+                data = json.loads(sc.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            docked = None
+            if local_dev:
+                docked = (LOCAL_ROOT / acct / local_dev / sid).exists()
+            out.append({
+                "session_id": sid,
+                "title": data.get("title"),
+                "path": str(sess_dir),
+                "folders": data.get("userSelectedFolders") or [],
+                "scheduled": data.get("sessionType") == "scheduled" or bool(data.get("scheduledTaskId")),
+                "docked": docked,
+            })
+    return out
 
 
 # ------------------------------------------------------------------- local tree probe

@@ -85,6 +85,26 @@ def cmd_dock(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_list(args: argparse.Namespace) -> int:
+    from .dock import load_source_dirs, scan_sessions
+    dirs = [args.dir] if args.dir else load_source_dirs()
+    if not dirs:
+        print("error: no source dir given and no 'source_dirs' in dock.json", file=sys.stderr)
+        return 2
+    sessions = scan_sessions(dirs)
+    if args.json:
+        print(json.dumps(sessions, indent=2))
+        return 0
+    if not sessions:
+        print("(no sessions found)")
+        return 0
+    for s in sessions:
+        kind = "task" if s["scheduled"] else "chat"
+        dk = "docked" if s["docked"] else ("new" if s["docked"] is False else "?")
+        print(f"[{kind}] {dk:6} {s['session_id']}  {s['title']!r}  {s['folders']}")
+    return 0
+
+
 def cmd_router(args: argparse.Namespace) -> int:
     # Lazy import so this command works without the mcp server deps loaded.
     from .mcp_router.config import load_config
@@ -137,6 +157,11 @@ def build_parser() -> argparse.ArgumentParser:
     ds.add_argument("action", choices=["status", "start", "stop", "restart"])
     ds.add_argument("--force", action="store_true", help="SIGKILL if graceful SIGTERM times out (stop/restart)")
     ds.set_defaults(func=cmd_desktop)
+
+    ls = sub.add_parser("list", help="list dockable sessions from source dirs")
+    ls.add_argument("dir", nargs="?", help="source dir (default: source_dirs from dock.json)")
+    ls.add_argument("--json", action="store_true", help="machine-readable output")
+    ls.set_defaults(func=cmd_list)
 
     r = sub.add_parser("router", help="filesystem router utilities")
     rsub = r.add_subparsers(dest="router_cmd", required=True)
