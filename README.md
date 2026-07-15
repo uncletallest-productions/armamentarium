@@ -161,14 +161,45 @@ armamentarium dock <session-dir> --apply --path-map /home/youruser/Scriptorium=/
 It refuses to overwrite an existing session id unless `--force`, warns if a rewritten
 folder still doesn't exist on this host, and prints the exact `rm` to undo the dock.
 
+### One-shot with restart
+
+Claude Desktop only re-scans the session tree at **startup** — a running instance won't
+show a freshly docked session until it's restarted. `--apply --restart` makes dock atomic:
+**stop Desktop → apply → start Desktop** (so files are never written under a live app):
+
+```bash
+cp config/desktop.example.json ~/.config/armamentarium/desktop.json   # once; edit for your install
+armamentarium dock <session-dir> --apply --restart
+```
+
+Stop is a graceful `SIGTERM` with a timeout; add `--force` to `SIGKILL` if it won't exit.
+
+## Claude Desktop control (`armamentarium desktop`)
+
+Optional, config-driven, and thin — armamentarium's core needs none of it. Configure
+`~/.config/armamentarium/desktop.json` (launch `command`, extra `env`, `process_match`,
+`term_timeout_s`), then:
+
+```bash
+armamentarium desktop status     # running? which pids?
+armamentarium desktop start      # launch (with configured env, e.g. CLAUDE_USE_WAYLAND=1)
+armamentarium desktop stop       # graceful SIGTERM (add --force for SIGKILL on timeout)
+armamentarium desktop restart    # stop then start
+```
+
+`process_match` matches the process **executable (argv[0])**, not arbitrary arguments, so a
+shell or editor that merely mentions the name is never targeted. Run `desktop status` once
+to confirm your install is detected before relying on `stop`/`restart`.
+
 ## Layout
 
 ```
 armamentarium/
   armamentarium/
     __init__.py
-    cli.py           # `armamentarium dock ...` entry point
+    cli.py           # `armamentarium dock ... / desktop ...` entry point
     dock.py          # session dock: discover local device, plan, rewrite, apply
+    desktop.py       # optional config-driven Claude Desktop process control
     mcp_router/
       __init__.py
       config.py      # allowlist + config loading (security boundary)
@@ -178,6 +209,7 @@ armamentarium/
   config/
     router.example.json
     dock.example.json
+    desktop.example.json
   pyproject.toml
 ```
 
