@@ -42,7 +42,12 @@ class DesktopConfig:
         self.command: List[str] = data.get("command") or []
         self.env: Dict[str, str] = data.get("env") or {}
         self.process_match: str = data.get("process_match") or ""
-        self.term_timeout_s: float = float(data.get("term_timeout_s", 8))
+        # Electron apps are multi-process (main + renderers + GPU + utility + zygote);
+        # graceful teardown of all of them can take a while, so default generously.
+        self.term_timeout_s: float = float(data.get("term_timeout_s", 15))
+        # Settle window after the last process exits, before relaunch — lets the
+        # single-instance lock/socket (shared ~/.config/Claude) fully release.
+        self.restart_settle_s: float = float(data.get("restart_settle_s", 2.5))
         if not self.command:
             raise DesktopError("desktop config missing 'command' (list, e.g. [\"/usr/bin/claude-desktop-unofficial\"])")
         if not self.process_match:
@@ -160,4 +165,20 @@ def restart(cfg: DesktopConfig, force: bool = False) -> dict:
             f"processes did not exit within {cfg.term_timeout_s}s: {s['still_alive']}. "
             f"Re-run with --force to SIGKILL, or close Claude Desktop manually."
         )
-    return {"action": "restart", "stopped": s, "started": start(cfg)}
+    # Settle: even after the processes are gone, the single-instance lock/socket may
+    # linger a moment. Wait, then double-check nothing respawned before relaunching.
+    settled = 0.0
+    if s.get("was_running"):
+        time.sleep(cfg.restart_settle_s)
+        settled = cfg.restart_settle_s
+        lingering = find_pids(cfg.process_match)
+        while lingering and settled < cfg.term_timeout_s:
+            time.sleep(0.5)
+            settled += 0.5
+            lingering = find_pids(cfg.process_match)
+        if lingering:
+            raise DesktopError(
+                f"processes reappeared after stop and did not clear: {lingering}. "
+                f"Not relaunching to avoid a double instance."
+            )
+    return {"action": "restart", "stopped": s, "settled_s": settled, "started": start(cfg)}

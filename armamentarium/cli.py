@@ -85,6 +85,19 @@ def cmd_dock(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_router(args: argparse.Namespace) -> int:
+    # Lazy import so this command works without the mcp server deps loaded.
+    from .mcp_router.config import load_config
+    from .mcp_router.router import FilesystemRouter
+    try:
+        r = FilesystemRouter(load_config())
+        print(json.dumps(r.status(), indent=2))
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+
 def cmd_desktop(args: argparse.Namespace) -> int:
     try:
         cfg = desktop_mod.load_desktop_config()
@@ -124,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
     ds.add_argument("action", choices=["status", "start", "stop", "restart"])
     ds.add_argument("--force", action="store_true", help="SIGKILL if graceful SIGTERM times out (stop/restart)")
     ds.set_defaults(func=cmd_desktop)
+
+    r = sub.add_parser("router", help="filesystem router utilities")
+    rsub = r.add_subparsers(dest="router_cmd", required=True)
+    rst = rsub.add_parser("status", help="print router roots + backends (from router.json)")
+    rst.set_defaults(func=cmd_router)
     return p
 
 

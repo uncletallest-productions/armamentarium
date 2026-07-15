@@ -1,7 +1,8 @@
 {
-  "_comment": "Copy to ~/.config/armamentarium/desktop.json. Controls how armamentarium stops/starts Claude Desktop (for `armamentarium desktop ...` and `dock --restart`). 'command' is the launch argv, 'env' is extra environment (e.g. native Wayland), 'process_match' is a substring used to find the running process, 'term_timeout_s' is how long to wait for a graceful SIGTERM before --force may SIGKILL. Values below match a claude-desktop-unofficial install on Linux.",
+  "_comment": "Copy to ~/.config/armamentarium/desktop.json. Controls how armamentarium stops/starts Claude Desktop (for `armamentarium desktop ...` and `dock --restart`). 'command' is the launch argv, 'env' is extra environment (e.g. native Wayland), 'process_match' is matched against the process executable (argv[0]) to find running instances, 'term_timeout_s' is how long to wait for a graceful SIGTERM before --force may SIGKILL (Electron is multi-process, so keep this generous), 'restart_settle_s' is the pause after the last process exits before relaunch so the single-instance lock/socket releases. Values below match a claude-desktop-unofficial install on Linux.",
   "command": ["/usr/bin/claude-desktop-unofficial"],
   "env": { "CLAUDE_USE_WAYLAND": "1" },
   "process_match": "claude-desktop-unofficial",
-  "term_timeout_s": 8
+  "term_timeout_s": 15,
+  "restart_settle_s": 2.5
 }
