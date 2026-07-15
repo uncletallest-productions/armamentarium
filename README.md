@@ -10,10 +10,10 @@ host it lands on into one working kit.
 
 Two capabilities, one tool:
 
-1. **Session roaming** — dock/undock Claude Desktop sessions between machines
-   (via shared NFS), rewriting the device-bound paths embedded in session
-   metadata. *(Design stage — see `docs`/the Substrate block; must run host-side,
-   see note below.)*
+1. **Session roaming** — dock Claude Desktop *chat* sessions onto a machine,
+   rewriting the mount-root paths (and, for fresh installs, the deviceUUID) embedded
+   in session metadata. *(Shipped — `armamentarium dock`; see "Session roaming" below.
+   Runs host-side. Scheduled tasks are out of scope — separate mechanism.)*
 2. **MCP filesystem router** — a backend-routing MCP server presenting generic
    filesystem tools (`read_file` / `write_file` / `list_directory` /
    `search_files` / `stat`) and forwarding each to whichever backend is live on
@@ -124,12 +124,51 @@ Example MCP client server entry:
 | `arma_search_files` | Find by name glob and/or content substring, depth/result-bounded |
 | `arma_router_status` | Loaded config, roots, and backend availability |
 
+## Session roaming (`armamentarium dock`)
+
+Dock a Claude Desktop **chat** session onto the current machine. Docking is:
+
+> sync the `local_<uuid>/` dir + its `local_<uuid>.json` sidecar into the local device
+> tree, then rewrite the stale **mount-root** paths in the sidecar (and, only if the
+> source session's **deviceUUID** differs from this machine's, rewrite that too and
+> rename the `.claude/projects/<slug>` dir).
+
+On a fleet where `~/.config/Claude` was cloned across machines the deviceUUID already
+matches, so docking reduces to the mount-root rewrite. Scheduled tasks are **out of
+scope** (they live in `scheduled-tasks.json` with a server-side id — a separate problem).
+
+Configure the mount-root map once:
+
+```bash
+mkdir -p ~/.config/armamentarium
+cp config/dock.example.json ~/.config/armamentarium/dock.json   # edit for your migrations
+```
+
+Dry-run by default (prints a plan, writes nothing):
+
+```bash
+armamentarium dock ~/Datasets/Substrate/dom0/sisyphus-archive/sessions/local_<uuid>
+```
+
+Apply it (quit Claude Desktop first so it re-scans on next launch):
+
+```bash
+armamentarium dock <session-dir> --apply
+# extra one-off mapping, e.g. the old Scriptorium name:
+armamentarium dock <session-dir> --apply --path-map /home/youruser/Scriptorium=/home/youruser/Datasets/Scriptorum
+```
+
+It refuses to overwrite an existing session id unless `--force`, warns if a rewritten
+folder still doesn't exist on this host, and prints the exact `rm` to undo the dock.
+
 ## Layout
 
 ```
 armamentarium/
   armamentarium/
     __init__.py
+    cli.py           # `armamentarium dock ...` entry point
+    dock.py          # session dock: discover local device, plan, rewrite, apply
     mcp_router/
       __init__.py
       config.py      # allowlist + config loading (security boundary)
@@ -138,15 +177,18 @@ armamentarium/
       server.py      # FastMCP tool surface + entry point
   config/
     router.example.json
+    dock.example.json
   pyproject.toml
 ```
 
 ## Status
 
-Prototype (v0.1.0). Router implemented and self-tested; session-roaming is design
-stage. The roaming half must run **host-side** (a script operating directly on the
-real filesystem) because the session tree it targets can't be reached from inside
-a sandboxed client session — which is precisely the gap this router closes.
+Prototype (v0.1.0). Router implemented and self-tested. Chat-session roaming
+(`armamentarium dock`) implemented and verified end-to-end: a real archived session
+docked onto another machine opens in Claude Desktop with full history and its folder
+reconnected. Runs host-side (the session tree it targets can't be reached from inside a
+sandboxed client — the gap the router closes). Remaining: scheduled-task portability
+(separate mechanism), `undock`/sync-back, remote router backends.
 
 ## License
 

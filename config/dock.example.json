@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to ~/.config/armamentarium/dock.json. 'path_map' rewrites stale mount roots in a session's userSelectedFolders (and cwd) when docking it onto this machine. Keys are matched longest-first so nested prefixes rewrite cleanly. Add entries per your migration history.",
+  "path_map": {
+    "/home/youruser/Substrate": "/home/youruser/Datasets/Substrate",
+    "/home/youruser/Scriptorium": "/home/youruser/Datasets/Scriptorum"
+  }
+}
