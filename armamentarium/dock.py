@@ -115,6 +115,8 @@ class DockPlan:
     usf_before: List[str]
     usf_after: List[str]
     rewrites: List[Rewrite]
+    is_scheduled: bool = False               # sessionType "scheduled" / has scheduledTaskId
+    scheduled_task_id: Optional[str] = None
     unmapped_stale: List[str] = field(default_factory=list)  # paths still not on disk after rewrite
 
 
@@ -143,6 +145,8 @@ def build_plan(
     sidecar = json.loads(sidecar_text)
     title = sidecar.get("title")
     usf_before = list(sidecar.get("userSelectedFolders") or [])
+    scheduled_task_id = sidecar.get("scheduledTaskId")
+    is_scheduled = sidecar.get("sessionType") == "scheduled" or bool(scheduled_task_id)
 
     # source deviceUUID from the sidecar cwd (segment after the account UUID)
     src_device = None
@@ -174,7 +178,8 @@ def build_plan(
         session_id=session_id, title=title, src_dir=src_dir, src_sidecar=src_sidecar,
         account=acct, local_device=local_device, src_device=src_device,
         dst_dir=dst_dir, dst_sidecar=dst_sidecar, collision=dst_dir.exists() or dst_sidecar.exists(),
-        usf_before=usf_before, usf_after=usf_after, rewrites=rewrites, unmapped_stale=unmapped,
+        usf_before=usf_before, usf_after=usf_after, rewrites=rewrites,
+        is_scheduled=is_scheduled, scheduled_task_id=scheduled_task_id, unmapped_stale=unmapped,
     )
 
 
@@ -187,6 +192,10 @@ def render_plan(p: DockPlan) -> str:
     dev = "same (no rewrite)" if p.src_device == p.local_device else f"{p.src_device} -> {p.local_device}"
     L.append(f"  deviceUUID : {dev}")
     L.append(f"  collision  : {'YES — will refuse without --force' if p.collision else 'no'}")
+    if p.is_scheduled:
+        L.append(f"  SCHEDULED  : this is a SCHEDULED TASK (scheduledTaskId={p.scheduled_task_id}) —")
+        L.append("               OUT OF SCOPE for dock. It carries server-side task state that")
+        L.append("               won't roam by copying files. Refused unless --allow-scheduled.")
     if p.rewrites:
         L.append("  rewrites   :")
         for r in p.rewrites:
@@ -205,7 +214,15 @@ def render_plan(p: DockPlan) -> str:
 
 # ------------------------------------------------------------------------------ apply
 
-def apply_plan(p: DockPlan, path_map: Dict[str, str], force: bool = False) -> dict:
+def apply_plan(p: DockPlan, path_map: Dict[str, str], force: bool = False,
+               allow_scheduled: bool = False) -> dict:
+    if p.is_scheduled and not allow_scheduled:
+        raise DockError(
+            f"{p.session_id} is a scheduled task (scheduledTaskId={p.scheduled_task_id}); "
+            f"dock is for chat sessions only. Scheduled-task portability is a separate, "
+            f"unsolved problem (server-side registration). Pass --allow-scheduled to force "
+            f"the file copy anyway (the task will likely be inert)."
+        )
     if p.collision and not force:
         raise DockError(f"session already present at {p.dst_dir} — pass --force to overwrite")
     if p.collision and force:

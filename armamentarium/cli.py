@@ -51,7 +51,7 @@ def cmd_dock(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        result = apply_plan(plan, path_map, force=args.force)
+        result = apply_plan(plan, path_map, force=args.force, allow_scheduled=args.allow_scheduled)
     except DockError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -73,6 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--account", help="account UUID override (if the local tree has more than one)")
     d.add_argument("--device", help="device UUID override (if the local tree has more than one)")
     d.add_argument("--force", action="store_true", help="overwrite an existing session of the same id")
+    d.add_argument("--allow-scheduled", action="store_true",
+                   help="force-copy a scheduled-task session (out of scope; will likely be inert)")
     d.set_defaults(func=cmd_dock)
     return p
 
