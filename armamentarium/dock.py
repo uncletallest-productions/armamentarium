@@ -20,6 +20,38 @@ server-side `scheduledTaskId`, a separate mechanism (see the caddy block).
 
 Safety: dry-run by default (prints a plan, writes nothing). Additive only — refuses to
 overwrite an existing session unless `--force`. Cleanup is deleting the two items it added.
+
+--- 2026-08-12: multi-root support -----------------------------------------------
+Originally this module only ever looked at LOCAL_ROOT (the primary Claude Desktop
+tree, ~/.config/Claude/local-agent-mode-sessions). It turns out at least one other
+tree exists on this fleet with the IDENTICAL local_<uuid>.json + local_<uuid>/
+shape: ~/.config/claude-harness/<profile>/session-data/local-agent-mode-sessions/,
+produced by the Erebos Harness Configurator (~/bin/HarnessConfigurator/) for
+multi-account testing (profiles: pro=dom1, free1=dom2, free2=dom3, free3=dom0).
+Verified byte-for-byte compatible against a real harness session before writing
+this: same sidecar keys, same audit.jsonl event shape (type/message/role/content
+blocks), same account+device UUID nesting. The only wrinkle is the harness signs
+each audit line with an HMAC (a sibling .audit-key file) — that's tamper-evidence,
+it doesn't change how the file reads.
+
+Every function below defaults to the exact old behavior (LOCAL_ROOT only, no
+`root` argument) so nothing that already calls this module needs to change.
+Multi-root is opt-in via `root=<label>` or the new discover_all_roots()/
+local_roots_config() for callers that want to see everything at once.
+
+Also added the same day, per Jerry's follow-up ("a mechanism to actually
+combine roots into a single group is a viable choice"): `root_groups` in
+dock.json, a named set of root labels (see root_groups_config()/
+resolve_root_group() below) so e.g. `list --local --root-group harness-all`
+can show what's docked across every claude-harness profile in one call
+instead of naming each one. This is pure config sugar over local_roots --
+it doesn't introduce a new storage concept, just a name for a set of
+existing ones.
+
+NOT covered by this pass: roaming.py (undock / checkout ledger) is a separate,
+unread module — cross-machine roaming of harness sessions is a deliberate
+stopping point here, not solved. dock (this file) is the only thing made
+multi-root-aware.
 """
 
 from __future__ import annotations
@@ -35,6 +67,8 @@ from typing import Dict, List, Optional, Tuple
 LOCAL_ROOT = Path("~/.config/Claude/local-agent-mode-sessions").expanduser()
 DOCK_CONFIG = Path("~/.config/armamentarium/dock.json").expanduser()
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+PRIMARY_ROOT_LABEL = "primary"
 
 
 class DockError(Exception):
@@ -68,16 +102,95 @@ def load_source_dirs(extra: Optional[List[str]] = None) -> List[str]:
     return [os.path.expanduser(d) for d in dirs]
 
 
+def local_roots_config() -> Dict[str, Path]:
+    """All configured local session-tree roots, keyed by label.
+
+    Always includes "primary" -> LOCAL_ROOT. Additional roots come from a
+    `local_roots` object in dock.json, e.g.:
+
+        {
+          "local_roots": {
+            "harness-pro":    "~/.config/claude-harness/pro/session-data/local-agent-mode-sessions",
+            "harness-free1":  "~/.config/claude-harness/free1/session-data/local-agent-mode-sessions",
+            "harness-free2":  "~/.config/claude-harness/free2/session-data/local-agent-mode-sessions",
+            "harness-free3":  "~/.config/claude-harness/free3/session-data/local-agent-mode-sessions"
+          }
+        }
+
+    A label of "primary" in config would override LOCAL_ROOT itself -- not
+    expected, but not blocked either.
+    """
+    roots: Dict[str, Path] = {PRIMARY_ROOT_LABEL: LOCAL_ROOT}
+    for label, p in _read_dock_config().get("local_roots", {}).items():
+        roots[label] = Path(p).expanduser()
+    return roots
+
+
+def resolve_root(root: Optional[str]) -> Path:
+    """Label -> Path, defaulting to the primary root. Raises on an unknown label."""
+    roots = local_roots_config()
+    label = root or PRIMARY_ROOT_LABEL
+    if label not in roots:
+        raise DockError(f"unknown root label {label!r}; configured roots: {sorted(roots)}")
+    return roots[label]
+
+
+def root_groups_config() -> Dict[str, List[str]]:
+    """Named groups of root labels, added 2026-08-12 alongside `local_roots` --
+    e.g. a dock.json with:
+
+        {
+          "local_roots": { "harness-pro": "...", "harness-free1": "...",
+                           "harness-free2": "...", "harness-free3": "..." },
+          "root_groups": { "harness-all": ["harness-pro", "harness-free1",
+                                           "harness-free2", "harness-free3"] }
+        }
+
+    lets a caller say --root-group harness-all once instead of naming every
+    profile, e.g. for `list --local --root-group harness-all` to show what's
+    docked across all four harness profiles in one merged table. This is a
+    pure config-level grouping over local_roots_config() -- it doesn't add a
+    new kind of root, just a name for a set of existing ones. Purely additive:
+    no root_groups key means an empty dict, nothing else changes."""
+    return _read_dock_config().get("root_groups", {})
+
+
+def resolve_root_group(group: str) -> List[Tuple[str, Path]]:
+    """Group label -> [(root_label, path), ...], each validated against
+    local_roots_config(). Raises if the group itself is unknown, or if it
+    references a root label that isn't actually configured (config drift --
+    e.g. a root_groups entry surviving after its local_roots entry was
+    renamed/removed)."""
+    groups = root_groups_config()
+    if group not in groups:
+        raise DockError(f"unknown root group {group!r}; configured groups: {sorted(groups)}")
+    roots = local_roots_config()
+    out: List[Tuple[str, Path]] = []
+    for label in groups[group]:
+        if label not in roots:
+            raise DockError(f"root group {group!r} references unknown root label {label!r} "
+                            f"(configured roots: {sorted(roots)})")
+        out.append((label, roots[label]))
+    return out
+
+
 def scan_sessions(dirs: List[str], account: Optional[str] = None,
-                  device: Optional[str] = None) -> List[dict]:
+                  device: Optional[str] = None, root: Optional[str] = None) -> List[dict]:
     """Enumerate `local_<uuid>` sessions under `dirs` with dock-relevant metadata.
 
     Each entry: session_id, title, path, folders, scheduled (bool), docked
     (True/False, or None if the local device tree couldn't be resolved).
+
+    `root` (a label from local_roots_config(), default "primary") controls
+    which local tree "docked" is checked against -- a harness-originated
+    session should be checked against its own harness root, not the primary
+    Claude tree, or "docked" will always read False/None even when it's
+    already there.
     """
+    root_path = resolve_root(root)
     local_dev = acct = None
     try:
-        acct, local_dev = discover_local(account, device)
+        acct, local_dev = discover_local(account, device, root=root)
     except DockError:
         pass  # docked-status stays unknown
 
@@ -99,7 +212,7 @@ def scan_sessions(dirs: List[str], account: Optional[str] = None,
                 continue
             docked = None
             if local_dev:
-                docked = (LOCAL_ROOT / acct / local_dev / sid).exists()
+                docked = (root_path / acct / local_dev / sid).exists()
             out.append({
                 "session_id": sid,
                 "title": data.get("title"),
@@ -107,6 +220,7 @@ def scan_sessions(dirs: List[str], account: Optional[str] = None,
                 "folders": data.get("userSelectedFolders") or [],
                 "scheduled": data.get("sessionType") == "scheduled" or bool(data.get("scheduledTaskId")),
                 "docked": docked,
+                "root": root or PRIMARY_ROOT_LABEL,
             })
     return out
 
@@ -117,23 +231,26 @@ def _uuid_children(d: Path) -> List[str]:
     return sorted(c.name for c in d.iterdir() if c.is_dir() and UUID_RE.match(c.name))
 
 
-def discover_local(account: Optional[str], device: Optional[str]) -> Tuple[str, str]:
-    """Find this machine's account + device UUID dirs under LOCAL_ROOT.
+def discover_local(account: Optional[str], device: Optional[str],
+                   root: Optional[str] = None) -> Tuple[str, str]:
+    """Find this machine's account + device UUID dirs under a local root.
 
     Uses the single UUID-shaped dir at each level; requires an explicit override only when
-    the choice is ambiguous.
+    the choice is ambiguous. `root` is a label from local_roots_config() -- default
+    "primary" (LOCAL_ROOT), so existing callers see zero behavior change.
     """
-    if not LOCAL_ROOT.exists():
-        raise DockError(f"local session root not found: {LOCAL_ROOT}")
-    accounts = _uuid_children(LOCAL_ROOT)
+    root_path = resolve_root(root)
+    if not root_path.exists():
+        raise DockError(f"local session root not found: {root_path}")
+    accounts = _uuid_children(root_path)
     if account is None:
         if len(accounts) != 1:
-            raise DockError(f"expected exactly 1 account UUID under {LOCAL_ROOT}, found {accounts}; pass --account")
+            raise DockError(f"expected exactly 1 account UUID under {root_path}, found {accounts}; pass --account")
         account = accounts[0]
     elif account not in accounts:
-        raise DockError(f"account {account} not found under {LOCAL_ROOT} (have {accounts})")
+        raise DockError(f"account {account} not found under {root_path} (have {accounts})")
 
-    acct_dir = LOCAL_ROOT / account
+    acct_dir = root_path / account
     devices = _uuid_children(acct_dir)
     if device is None:
         if len(devices) != 1:
@@ -144,11 +261,32 @@ def discover_local(account: Optional[str], device: Optional[str]) -> Tuple[str, 
     return account, device
 
 
-def local_device_dir(account: Optional[str] = None, device: Optional[str] = None) -> Path:
+def discover_all_roots(account: Optional[str] = None, device: Optional[str] = None
+                       ) -> List[Tuple[str, str, str, Path]]:
+    """Best-effort discover_local() across EVERY configured root.
+
+    Returns one (root_label, account, device, root_path) tuple per root that
+    resolves cleanly; roots that don't exist or are ambiguous (multiple
+    accounts/devices without an override) are silently skipped -- this is a
+    "show me what's here" helper, not a strict one, so one messy root
+    shouldn't blank out the rest.
+    """
+    out = []
+    for label, root_path in local_roots_config().items():
+        try:
+            acct, dev = discover_local(account, device, root=label)
+        except DockError:
+            continue
+        out.append((label, acct, dev, root_path))
+    return out
+
+
+def local_device_dir(account: Optional[str] = None, device: Optional[str] = None,
+                     root: Optional[str] = None) -> Path:
     """The live device session dir on this machine — where docked sessions live
-    (i.e. the undock candidates)."""
-    acct, dev = discover_local(account, device)
-    return LOCAL_ROOT / acct / dev
+    (i.e. the undock candidates). `root` picks which configured tree, default primary."""
+    acct, dev = discover_local(account, device, root=root)
+    return resolve_root(root) / acct / dev
 
 
 # ------------------------------------------------------------------------------- plan
@@ -179,6 +317,7 @@ class DockPlan:
     is_scheduled: bool = False               # sessionType "scheduled" / has scheduledTaskId
     scheduled_task_id: Optional[str] = None
     unmapped_stale: List[str] = field(default_factory=list)  # paths still not on disk after rewrite
+    root_label: str = PRIMARY_ROOT_LABEL     # which configured local tree this docks into
 
 
 def _apply_map(text: str, path_map: Dict[str, str]) -> str:
@@ -193,7 +332,15 @@ def build_plan(
     path_map: Dict[str, str],
     account: Optional[str] = None,
     device: Optional[str] = None,
+    root: Optional[str] = None,
 ) -> DockPlan:
+    """Build a dock plan. `root` (label from local_roots_config(), default "primary")
+    picks which local tree this session docks INTO. A harness-originated session
+    should generally dock back into its own harness root (e.g. root="harness-pro"),
+    not the primary Claude tree -- docking it into "primary" would put a
+    harness-only session where the real Claude Desktop app looks, which is
+    almost certainly not what you want. Nothing infers this automatically;
+    the caller (or --root on the CLI) has to say which tree."""
     src_dir = Path(session_path).expanduser().resolve()
     if not src_dir.is_dir() or not src_dir.name.startswith("local_"):
         raise DockError(f"source must be a 'local_<uuid>' session directory: {session_path}")
@@ -216,7 +363,9 @@ def build_plan(
     if m:
         src_device = m.group(1)
 
-    acct, local_device = discover_local(account, device)
+    acct, local_device = discover_local(account, device, root=root)
+    root_label = root or PRIMARY_ROOT_LABEL
+    root_path = resolve_root(root)
 
     rewrites: List[Rewrite] = []
     for old in sorted(path_map, key=len, reverse=True):
@@ -229,7 +378,7 @@ def build_plan(
 
     usf_after = [_apply_map(p, path_map) for p in usf_before]
 
-    dst_dir = LOCAL_ROOT / acct / local_device / session_id
+    dst_dir = root_path / acct / local_device / session_id
     dst_sidecar = dst_dir.with_name(session_id + ".json")
 
     # After rewrite, warn about any selected folder that still won't exist on this host.
@@ -241,6 +390,7 @@ def build_plan(
         dst_dir=dst_dir, dst_sidecar=dst_sidecar, collision=dst_dir.exists() or dst_sidecar.exists(),
         usf_before=usf_before, usf_after=usf_after, rewrites=rewrites,
         is_scheduled=is_scheduled, scheduled_task_id=scheduled_task_id, unmapped_stale=unmapped,
+        root_label=root_label,
     )
 
 
@@ -248,6 +398,7 @@ def render_plan(p: DockPlan) -> str:
     L = []
     L.append(f"dock plan: {p.session_id}" + (f"  ({p.title!r})" if p.title else ""))
     L.append(f"  source     : {p.src_dir}")
+    L.append(f"  dest root  : {p.root_label}")
     L.append(f"  dest       : {p.dst_dir}")
     L.append(f"  account    : {p.account}")
     dev = "same (no rewrite)" if p.src_device == p.local_device else f"{p.src_device} -> {p.local_device}"
@@ -293,6 +444,7 @@ def apply_plan(p: DockPlan, path_map: Dict[str, str], force: bool = False,
             p.dst_sidecar.unlink()
 
     # 1. sync the session directory
+    p.dst_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(p.src_dir, p.dst_dir)
 
     # 2. deviceUUID: rename the .claude/projects/<slug> dir + rewrite text within the copy
@@ -309,6 +461,7 @@ def apply_plan(p: DockPlan, path_map: Dict[str, str], force: bool = False,
     return {
         "docked": True,
         "session_id": p.session_id,
+        "root": p.root_label,
         "dst_dir": str(p.dst_dir),
         "dst_sidecar": str(p.dst_sidecar),
         "cleanup": f'rm -rf "{p.dst_dir}" "{p.dst_sidecar}"',
