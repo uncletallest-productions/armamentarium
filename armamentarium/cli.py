@@ -323,8 +323,6 @@ def cmd_fleet(args: argparse.Namespace) -> int:
         return 2
 
 
-<<<<<<< Updated upstream
-=======
 def cmd_config(args: argparse.Namespace) -> int:
     """`armamentarium config capture|diff|deploy|status` — fleet dotfile/config
     sync. Deliberately separate from `armamentarium fleet` (machine presence/
@@ -362,7 +360,6 @@ def cmd_config(args: argparse.Namespace) -> int:
         return 2
 
 
->>>>>>> Stashed changes
 def cmd_desktop(args: argparse.Namespace) -> int:
     try:
         cfg = desktop_mod.load_desktop_config()
@@ -493,8 +490,6 @@ def build_parser() -> argparse.ArgumentParser:
                       help="SSH timeout per machine (default: 10)")
     fls2.set_defaults(func=cmd_fleet)
 
-<<<<<<< Updated upstream
-=======
     cfg = sub.add_parser("config", help="fleet config capture/diff/deploy (dotfiles, NOT machine presence — see 'fleet')")
     cfgsub = cfg.add_subparsers(dest="config_cmd", required=True)
 
@@ -525,7 +520,6 @@ def build_parser() -> argparse.ArgumentParser:
     cfga.add_argument("--host", help="override hostname (default: this machine)")
     cfga.set_defaults(func=cmd_config)
 
->>>>>>> Stashed changes
     return p
 
 
