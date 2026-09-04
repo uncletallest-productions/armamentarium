@@ -10,6 +10,13 @@ or via the console script ``armamentarium-fs``.
 
 The allowlist in the config file is the security boundary; with no config, every
 path is denied until one is supplied (fail-closed). See config.py.
+
+Note on destructive ops over this transport: stdio MCP has no equivalent of a
+UI confirmation dialog, so `arma_delete_path` requires the caller to pass
+`confirm: true` explicitly rather than defaulting to a silent delete — a text
+gate, not a real approval flow. A richer human-in-the-loop confirmation (diff
+preview + a blocking approval dialog) is implemented on the Open WebUI Tools
+front door instead, where an interactive UI actually exists to ask a person.
 """
 
 from __future__ import annotations
@@ -96,6 +103,20 @@ class WriteFileInput(BaseModel):
     create_dirs: bool = Field(default=False, description="If true, create missing parent directories.")
 
 
+class DeletePathInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    path: str = Field(..., description="File or directory path to delete. Must lie within an allowlisted root that grants 'rw' access.", min_length=1)
+    recursive: bool = Field(default=False, description="Required to delete a non-empty directory (and everything inside it).")
+    confirm: bool = Field(
+        ...,
+        description=(
+            "Must be explicitly set to true. This transport has no interactive confirmation "
+            "dialog, so this field is the only safety gate against an accidental delete — "
+            "there is no default; the caller must state the intent plainly."
+        ),
+    )
+
+
 class ListDirectoryInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     path: str = Field(..., description="Directory path to list. Must lie within an allowlisted root.", min_length=1)
@@ -172,6 +193,37 @@ async def arma_write_file(params: WriteFileInput) -> str:
             params.path, params.content, params.overwrite, params.create_dirs
         )
         return json.dumps({"written": True, "path": resolved, "bytes": n, "backend": backend}, indent=2)
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="arma_delete_path",
+    annotations={"title": "Delete Path", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+)
+async def arma_delete_path(params: DeletePathInput) -> str:
+    """Delete a file or directory through the router.
+
+    Enforces the allowlist AND that the matching root grants 'rw' — identical
+    requirement to a write, since a delete is just as destructive. This
+    transport (stdio MCP) has no interactive confirmation dialog, so `confirm`
+    must be explicitly set true; there is no default that allows a silent
+    delete. A non-empty directory additionally requires `recursive=true`.
+
+    Args:
+        params (DeletePathInput):
+            - path (str): file or directory to delete (must be under an 'rw' root)
+            - recursive (bool): required for a non-empty directory (default false)
+            - confirm (bool): must be true; the only safety gate on this transport
+
+    Returns:
+        str: JSON {"deleted": true, "path": str, "backend": str} or "Error: <reason>".
+    """
+    if not params.confirm:
+        return "Error: confirm must be set to true to delete a path — this is deliberate, not a bug."
+    try:
+        resolved, backend = get_router().delete_path(params.path, params.recursive)
+        return json.dumps({"deleted": True, "path": resolved, "backend": backend}, indent=2)
     except Exception as e:  # noqa: BLE001
         return _handle_error(e)
 

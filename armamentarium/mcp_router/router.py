@@ -6,7 +6,8 @@ All security lives here. Every filesystem operation goes through
 1. Expands ``~`` and resolves symlinks to a canonical absolute path
    (so ``../`` and symlink escapes can't sneak outside an allowed root).
 2. Confirms the resolved path lies within an allowlisted root.
-3. For writes, confirms the matching root grants ``rw``.
+3. For writes (and deletes — a delete is a write against the parent's
+   contents), confirms the matching root grants ``rw``.
 
 then hands the canonical path to the first available backend that can serve it.
 Backends never see un-resolved or un-checked paths.
@@ -15,11 +16,12 @@ Backends never see un-resolved or un-checked paths.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .backends import Backend, DirEntry, LocalFilesystemBackend, StatResult
-from .config import Root, RouterConfig
+from .config import Root, RouterConfig, load_elevation
 
 
 class RouterError(Exception):
@@ -31,7 +33,7 @@ class PathNotAllowedError(RouterError):
 
 
 class AccessDeniedError(RouterError):
-    """Raised when a write targets a read-only root."""
+    """Raised when a write (or delete) targets a read-only root."""
 
 
 class NoBackendError(RouterError):
@@ -62,33 +64,55 @@ class FilesystemRouter:
 
     # -- path safety -------------------------------------------------------
 
-    def _match_root(self, resolved: str) -> Optional[Root]:
-        for root in self.config.roots:
+    def _match_root(self, resolved: str, roots: Optional[List[Root]] = None) -> Optional[Root]:
+        """Return the most specific (longest-path) matching root, not the
+        first one listed — so entry order in router.json/elevate.json can
+        never silently shadow a more specific rw grant with a broader r one."""
+        best: Optional[Root] = None
+        for root in roots if roots is not None else self.config.roots:
             if resolved == root.path or resolved.startswith(root.path + os.sep):
-                return root
-        return None
+                if best is None or len(root.path) > len(best.path):
+                    best = root
+        return best
 
     def resolve(self, path: str, *, for_write: bool = False) -> Tuple[str, Root]:
         """Resolve ``path`` to a canonical form and enforce the allowlist.
 
+        Checks the base config first, then falls back to a time-boxed
+        elevation grant (``elevate.json``, if present and unexpired) — see
+        ``config.load_elevation``. Elevation is consulted fresh on every
+        call, never cached, so a manual revoke or a natural expiry takes
+        effect on the very next operation, not just after a restart.
+
         Returns ``(resolved_absolute_path, matched_root)``.
 
         Raises:
-            PathNotAllowedError: path is outside every allowlisted root.
-            AccessDeniedError: write requested against a read-only root.
+            PathNotAllowedError: path is outside every allowlisted root,
+                including any active elevation.
+            AccessDeniedError: write (or delete) requested against a
+                read-only root.
         """
         resolved = os.path.realpath(Path(path).expanduser())
         root = self._match_root(resolved)
+        elevation = None
+        if root is None:
+            elevation = load_elevation()
+            if elevation.active:
+                root = self._match_root(resolved, roots=elevation.roots)
         if root is None:
             allowed = ", ".join(r.raw for r in self.config.roots) or "(none configured)"
+            extra = ""
+            if elevation is not None and elevation.roots and not elevation.active:
+                extra = " An elevation grant exists but has expired; re-run arma-elevate if this access is still needed."
             raise PathNotAllowedError(
                 f"path {path!r} resolves to {resolved!r}, which is outside all "
-                f"allowlisted roots. Allowed roots: {allowed}."
+                f"allowlisted roots. Allowed roots: {allowed}.{extra}"
             )
         if for_write and not root.writable:
             raise AccessDeniedError(
-                f"path {path!r} is under read-only root {root.raw!r}; writes are denied. "
-                f"Grant this root \"access\": \"rw\" in the router config to allow writing."
+                f"path {path!r} is under read-only root {root.raw!r}; writes/deletes are denied. "
+                f"Grant this root \"access\": \"rw\" in the router config to allow writing, "
+                f"or ask the operator to run arma-elevate for a time-boxed rw grant."
             )
         return resolved, root
 
@@ -115,6 +139,15 @@ class FilesystemRouter:
         backend = self._pick_backend(resolved)
         return backend.write_file(resolved, content, overwrite, create_dirs), resolved, backend.name
 
+    def delete_path(self, path: str, recursive: bool = False) -> Tuple[str, str]:
+        """Delete a file or directory. Requires an 'rw' root, same as write —
+        a delete is destructive in the same way a write is, just aimed at the
+        whole entry instead of its contents."""
+        resolved, root = self.resolve(path, for_write=True)
+        backend = self._pick_backend(resolved)
+        backend.delete(resolved, recursive)
+        return resolved, backend.name
+
     def list_directory(self, path: str) -> Tuple[List[DirEntry], str, str]:
         resolved, root = self.resolve(path)
         backend = self._pick_backend(resolved)
@@ -140,8 +173,19 @@ class FilesystemRouter:
     # -- diagnostics -------------------------------------------------------
 
     def status(self) -> dict:
+        elevation = load_elevation()
         return {
             "config_source": self.config.source,
             "roots": [{"path": r.raw, "resolved": r.path, "access": r.access} for r in self.config.roots],
             "backends": [{"name": b.name, "available": b.available()} for b in self.backends],
+            "elevation": {
+                "active": elevation.active,
+                "expires_at": elevation.expires_at,
+                "expires_in_seconds": (
+                    round(elevation.expires_at - time.time()) if elevation.active else None
+                ),
+                "roots": [
+                    {"path": r.raw, "resolved": r.path, "access": r.access} for r in elevation.roots
+                ],
+            },
         }

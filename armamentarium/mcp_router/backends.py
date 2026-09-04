@@ -16,6 +16,7 @@ from __future__ import annotations
 import abc
 import fnmatch
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -61,6 +62,9 @@ class Backend(abc.ABC):
 
     @abc.abstractmethod
     def write_file(self, path: str, content: str, overwrite: bool, create_dirs: bool) -> int: ...
+
+    @abc.abstractmethod
+    def delete(self, path: str, recursive: bool) -> None: ...
 
     @abc.abstractmethod
     def list_directory(self, path: str) -> List[DirEntry]: ...
@@ -139,6 +143,29 @@ class LocalFilesystemBackend(Backend):
         tmp.write_bytes(encoded)
         os.replace(tmp, p)
         return len(encoded)
+
+    def delete(self, path: str, recursive: bool) -> None:
+        """Delete a file or directory.
+
+        A non-empty directory requires ``recursive=True`` — mirrors the
+        existing safety pattern elsewhere in this codebase (dock.py's
+        explicit ``--force``/``--allow-scheduled``): no destructive op is
+        implicit. A symlink is unlinked, never followed into its target.
+        """
+        p = Path(path)
+        if p.is_symlink():
+            p.unlink()
+            return
+        if not p.exists():
+            raise FileNotFoundError(f"no such path: {path}")
+        if p.is_dir():
+            if not recursive and any(p.iterdir()):
+                raise IsADirectoryError(
+                    f"directory not empty: {path}. Pass recursive=true to delete it and everything inside."
+                )
+            shutil.rmtree(p)
+        else:
+            p.unlink()
 
     def list_directory(self, path: str) -> List[DirEntry]:
         p = Path(path)

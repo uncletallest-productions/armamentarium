@@ -323,6 +323,46 @@ def cmd_fleet(args: argparse.Namespace) -> int:
         return 2
 
 
+<<<<<<< Updated upstream
+=======
+def cmd_config(args: argparse.Namespace) -> int:
+    """`armamentarium config capture|diff|deploy|status` — fleet dotfile/config
+    sync. Deliberately separate from `armamentarium fleet` (machine presence/
+    registry) to avoid colliding with the existing `fleet status` verb."""
+    from . import config_sync
+    try:
+        if args.config_cmd == "capture":
+            print(json.dumps(config_sync.capture(host=args.host), indent=2))
+        elif args.config_cmd == "diff":
+            print(json.dumps(config_sync.diff(args.host_a, args.host_b).as_dict(), indent=2))
+        elif args.config_cmd == "deploy":
+            result = config_sync.deploy(host=args.host, force=args.force)
+            print(json.dumps(result, indent=2))
+            if result["refused_drift"]:
+                return 1
+        elif args.config_cmd == "status":
+            print(json.dumps(config_sync.status(host=args.host), indent=2))
+        elif args.config_cmd == "untrack":
+            config_sync.untrack(args.path, host=args.host)
+            print(f"untracked: {args.path}")
+        elif args.config_cmd == "adopt":
+            result = config_sync.adopt(host=args.host)
+            print(json.dumps(result, indent=2))
+            if result["new"]:
+                print(f"\nadded {len(result['new'])} path(s) to tracked.txt — run "
+                      "`armamentarium config capture` to actually mirror them.")
+            if result["no_live_source"]:
+                print(f"\n{len(result['no_live_source'])} mirrored file(s) have no live "
+                      "counterpart under ~/.config — left untouched, not adopted:")
+                for p in result["no_live_source"]:
+                    print(f"  {p}")
+        return 0
+    except config_sync.ConfigSyncError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+
+>>>>>>> Stashed changes
 def cmd_desktop(args: argparse.Namespace) -> int:
     try:
         cfg = desktop_mod.load_desktop_config()
@@ -453,6 +493,39 @@ def build_parser() -> argparse.ArgumentParser:
                       help="SSH timeout per machine (default: 10)")
     fls2.set_defaults(func=cmd_fleet)
 
+<<<<<<< Updated upstream
+=======
+    cfg = sub.add_parser("config", help="fleet config capture/diff/deploy (dotfiles, NOT machine presence — see 'fleet')")
+    cfgsub = cfg.add_subparsers(dest="config_cmd", required=True)
+
+    cfgc = cfgsub.add_parser("capture", help="push this host's tracked dotfiles into the shared store")
+    cfgc.add_argument("--host", help="override hostname (default: this machine)")
+    cfgc.set_defaults(func=cmd_config)
+
+    cfgd = cfgsub.add_parser("diff", help="compare two hosts' captured manifests")
+    cfgd.add_argument("host_a")
+    cfgd.add_argument("host_b")
+    cfgd.set_defaults(func=cmd_config)
+
+    cfgdp = cfgsub.add_parser("deploy", help="restore this host's tracked files from the store (self-heal/rollback)")
+    cfgdp.add_argument("--host", help="override hostname (default: this machine; another host = deliberate manual clone)")
+    cfgdp.add_argument("--force", action="store_true", help="overwrite even where the live file has uncaptured edits")
+    cfgdp.set_defaults(func=cmd_config)
+
+    cfgs = cfgsub.add_parser("status", help="tracked/captured counts, last capture time, live-vs-store drift")
+    cfgs.add_argument("--host", help="override hostname (default: this machine)")
+    cfgs.set_defaults(func=cmd_config)
+
+    cfgu = cfgsub.add_parser("untrack", help="drop a path from this host's manifest (mirror copy kept as history)")
+    cfgu.add_argument("path", help="path relative to ~/.config")
+    cfgu.add_argument("--host", help="override hostname (default: this machine)")
+    cfgu.set_defaults(func=cmd_config)
+
+    cfga = cfgsub.add_parser("adopt", help="add pre-existing mirrored files (with a live ~/.config counterpart) to tracked.txt")
+    cfga.add_argument("--host", help="override hostname (default: this machine)")
+    cfga.set_defaults(func=cmd_config)
+
+>>>>>>> Stashed changes
     return p
 
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=armamentarium config capture — automatic layer over the explicit capture verb
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Adjust the path if armamentarium-config-watch.sh isn't deployed to this
+# location on your host — this assumes the armamentarium repo's config/ dir
+# is copied to ~/bin/armamentarium/config/ the way stoa-hubs helpers are.
+ExecStart=%h/bin/armamentarium/config/armamentarium-config-watch.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
