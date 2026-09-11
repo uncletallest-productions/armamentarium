@@ -26,7 +26,19 @@
 
 set -euo pipefail
 
-TRACKED_FILE="${HOME}/Datasets/Cubicles/Continuatus/arma-fleet/config/$(hostname -s)/tracked.txt"
+# Store location -- same resolution order as config_sync.resolve_store_root()
+# (2026-09-11: store moving to ~/Datasets/Profectionis/fleet-config; no fallback
+# to the legacy Continuatus store once a host has the Profectionis mountpoint).
+resolve_store_root() {
+  if [ -n "${ARMA_FLEET_ROOT:-}" ]; then echo "$ARMA_FLEET_ROOT"; return; fi
+  if [ -d "${HOME}/Datasets/Profectionis" ]; then echo "${HOME}/Datasets/Profectionis/fleet-config"; return; fi
+  for legacy in "${HOME}/Datasets/Continuatus/arma-fleet" "${HOME}/Datasets/Cubicles/Continuatus/arma-fleet"; do
+    if [ -d "${legacy}/config" ]; then echo "$legacy"; return; fi
+  done
+  echo "${HOME}/Datasets/Profectionis/fleet-config"
+}
+STORE_ROOT="$(resolve_store_root)"
+TRACKED_FILE="${STORE_ROOT}/config/$(hostname -s)/tracked.txt"
 DEBOUNCE_SECONDS=2
 
 if [ ! -f "$TRACKED_FILE" ]; then

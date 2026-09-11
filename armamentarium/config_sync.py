@@ -66,7 +66,36 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_ROOT = Path("~/Datasets/Cubicles/Continuatus/arma-fleet").expanduser()
+# Store location. 2026-09-11 (operator decision): the store moves to
+# Mechanicum/Profectionis, mounted at ~/Datasets/Profectionis, and Continuatus
+# itself moves up from ~/Datasets/Cubicles/ to ~/Datasets/. Resolution order:
+#   1. $ARMA_FLEET_ROOT, if set.
+#   2. ~/Datasets/Profectionis/fleet-config -- whenever the host HAS a
+#      ~/Datasets/Profectionis mountpoint, even if it is empty or offline. No
+#      silent fallback to the legacy store once Profectionis is provisioned: a
+#      capture landing in a stale store is a split brain, and a loud "no
+#      tracked.txt" error is the correct failure (the next scan catches up).
+#   3. Legacy Continuatus locations, only on hosts not yet given the mount.
+PROFECTIONIS_ROOT = Path("~/Datasets/Profectionis/fleet-config").expanduser()
+LEGACY_ROOTS = (
+    Path("~/Datasets/Continuatus/arma-fleet").expanduser(),
+    Path("~/Datasets/Cubicles/Continuatus/arma-fleet").expanduser(),
+)
+
+
+def resolve_store_root() -> Path:
+    env = os.environ.get("ARMA_FLEET_ROOT")
+    if env:
+        return Path(env).expanduser()
+    if PROFECTIONIS_ROOT.parent.is_dir():
+        return PROFECTIONIS_ROOT
+    for legacy in LEGACY_ROOTS:
+        if (legacy / "config").is_dir():
+            return legacy
+    return PROFECTIONIS_ROOT
+
+
+DEFAULT_ROOT = resolve_store_root()
 
 # Paths (relative to ~/.config) that are runtime state, not config to preserve,
 # per the original 2026-08-26 design decision. `adopt` never proposes these even
@@ -174,7 +203,12 @@ def _save_manifest(data: dict, host: Optional[str] = None, root: Path = DEFAULT_
 
 def _git_commit_best_effort(root: Path, message: str) -> Optional[str]:
     """Best-effort git add+commit in the store. Never raises — a missing git
-    binary or a store that isn't a repo yet shouldn't block a capture."""
+    binary or a store that isn't a repo yet shouldn't block a capture.
+
+    Returns the new commit's short SHA on success, or a human-readable note
+    explaining why nothing was committed. 2026-09-11: it used to return None on
+    success, so a perfectly good capture reported `"commit": null` and read like
+    a failure (it isn't — the commit was there all along)."""
     try:
         if not (root / ".git").is_dir():
             return "not a git repo — skipped commit"
@@ -185,7 +219,9 @@ def _git_commit_best_effort(root: Path, message: str) -> Optional[str]:
         if result.returncode != 0:
             # commonly "nothing to commit" — not an error
             return result.stdout.strip() or result.stderr.strip()
-        return None
+        rev = subprocess.run(["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+                             capture_output=True, timeout=15, text=True)
+        return rev.stdout.strip() or "committed"
     except Exception as e:  # noqa: BLE001
         return f"git commit skipped: {e}"
 
