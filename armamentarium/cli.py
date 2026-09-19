@@ -365,13 +365,20 @@ def cmd_packages(args: argparse.Namespace) -> int:
     provider/consumer. Scoped 2026-09-18 across apt/Nala, Flatpak, Snap, and
     AppImage/GearLever; only apt's `sync-cache` action is implemented so far
     (the other surfaces, and apt's own manifest capture/restore, are tracked
-    as follow-on work — see armamentarium/packages.py's module docstring)."""
+    as follow-on work — see armamentarium/packages.py's module docstring).
+
+    Dry-run by default, like `dock` — nothing is copied or triggered remotely
+    unless --apply is given."""
     from . import packages
     try:
         if args.packages_surface == "apt":
             if args.apt_cmd == "sync-cache":
-                result = packages.apt_sync_cache(dry_run=args.dry_run)
+                dry_run = not args.apply
+                result = packages.apt_sync_cache(dry_run=dry_run)
                 print(json.dumps(result.as_dict(), indent=2))
+                if dry_run:
+                    print("\n(dry run — nothing copied, remote not touched. "
+                          "Re-run with --apply to execute.)")
                 return 0
         print(f"error: unimplemented: packages {args.packages_surface} "
               f"{getattr(args, args.packages_surface + '_cmd', '')}", file=sys.stderr)
@@ -549,9 +556,11 @@ def build_parser() -> argparse.ArgumentParser:
     pkasc = pkasub.add_parser("sync-cache",
                                help="rsync new .debs from this machine's apt cache to the configured "
                                     "fleet-offline-repo host, then trigger its reindex script "
-                                    "(replaces the manual copy + update-fleet-repo workflow)")
-    pkasc.add_argument("--dry-run", action="store_true",
-                        help="show what would be synced without copying or reindexing")
+                                    "(replaces the manual copy + update-fleet-repo workflow). "
+                                    "dry-run by default.")
+    pkasc.add_argument("--apply", action="store_true",
+                        help="actually copy the .debs and trigger the remote reindex "
+                             "(default: dry-run, shows what would sync)")
     pkasc.set_defaults(func=cmd_packages)
 
     return p
