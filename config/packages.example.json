@@ -1,0 +1,9 @@
+{
+  "apt": {
+    "host": "haphaestus",
+    "remote_repo_dir": "/srv/Archivum/Horreum/fleet-offline-repo",
+    "remote_reindex_cmd": "sudo update-fleet-repo",
+    "cache_dir": "/var/cache/apt/archives",
+    "ssh_identity": "~/.ssh/id_fleet_stoa"
+  }
+}
