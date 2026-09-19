@@ -244,17 +244,18 @@ implemented so far — everything else is tracked, unimplemented, in
 
 `packages apt sync-cache` automates what used to be a manual two-step: copy new
 `.deb`s out of this machine's apt cache into the fleet's flat-file offline repo,
-then trigger that host's reindex script.
+then trigger that host's reindex script. **Dry-run by default**, like `dock` —
+nothing is copied or triggered remotely unless `--apply` is given.
 
 ```bash
 mkdir -p ~/.config/armamentarium
 cp config/packages.example.json ~/.config/armamentarium/packages.json   # edit host/paths
-armamentarium packages apt sync-cache            # rsync --ignore-existing, then remote reindex
-armamentarium packages apt sync-cache --dry-run  # show what would sync, touch nothing remote
+armamentarium packages apt sync-cache            # dry run: shows what would sync, touches nothing
+armamentarium packages apt sync-cache --apply    # rsync --ignore-existing, then remote reindex
 ```
 
-`--ignore-existing` makes it safe to run repeatedly (only new `.deb`s copy) or on a
-timer. The remote reindex trigger is a plain `ssh <host> <remote_reindex_cmd>` —
+`--ignore-existing` makes `--apply` safe to run repeatedly (only new `.deb`s copy) or
+on a timer. The remote reindex trigger is a plain `ssh <host> <remote_reindex_cmd>` —
 passwordless key auth (`ssh_identity` in packages.json) and, if the reindex command
 itself needs `sudo`, a NOPASSWD entry for that one command on the remote host are
 both on you to have set up; this module doesn't manage either.
@@ -294,11 +295,11 @@ docked onto another machine opens in Claude Desktop with full history and its fo
 reconnected. Runs host-side (the session tree it targets can't be reached from inside a
 sandboxed client — the gap the router closes). Cross-machine roaming — `undock` +
 checkout ledger — implemented and self-tested (checkout/hold-refusal/release/flush).
-`packages apt sync-cache` is new (2026-09-18) and not yet run against the real fleet —
-verify against haphaestus before relying on it. Remaining: scheduled-task portability
-(separate mechanism), Avahi presence + auto stale-lock detection, remote router
-backends, the rest of the `packages` surface (apt manifest capture/restore, Flatpak,
-Snap, AppImage/GearLever).
+`packages apt sync-cache` verified 2026-09-18: dry-run confirmed against the real
+haphaestus fleet-offline-repo; `--apply` (rsync + passwordless-sudo remote reindex)
+not yet run for real. Remaining: scheduled-task portability (separate mechanism),
+Avahi presence + auto stale-lock detection, remote router backends, the rest of the
+`packages` surface (apt manifest capture/restore, Flatpak, Snap, AppImage/GearLever).
 
 ## License
 
