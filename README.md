@@ -20,6 +20,11 @@ Two capabilities, one tool:
    the current host. *(Shipped first — this is the `armamentarium.mcp_router`
    package.)*
 
+Also shipped, below decks (see their own sections): `armamentarium fleet` (machine
+presence/registry), `armamentarium config` (fleet dotfile capture/diff/deploy), and
+the first stub of `armamentarium packages` (package-state sync — currently just the
+`apt sync-cache` action).
+
 ## Why the router exists
 
 - **It works when the first-party Filesystem MCP doesn't.** During the July 2026
@@ -230,16 +235,43 @@ armamentarium desktop restart    # stop then start
 shell or editor that merely mentions the name is never targeted. Run `desktop status` once
 to confirm your install is detected before relying on `stop`/`restart`.
 
+## Package sync (`armamentarium packages`)
+
+First stub (2026-09-18) of a below-decks package-state provider/consumer, scoped
+across apt/Nala, Flatpak, Snap, and AppImage/GearLever. Only one action is
+implemented so far — everything else is tracked, unimplemented, in
+`armamentarium/packages.py`'s module docstring.
+
+`packages apt sync-cache` automates what used to be a manual two-step: copy new
+`.deb`s out of this machine's apt cache into the fleet's flat-file offline repo,
+then trigger that host's reindex script.
+
+```bash
+mkdir -p ~/.config/armamentarium
+cp config/packages.example.json ~/.config/armamentarium/packages.json   # edit host/paths
+armamentarium packages apt sync-cache            # rsync --ignore-existing, then remote reindex
+armamentarium packages apt sync-cache --dry-run  # show what would sync, touch nothing remote
+```
+
+`--ignore-existing` makes it safe to run repeatedly (only new `.deb`s copy) or on a
+timer. The remote reindex trigger is a plain `ssh <host> <remote_reindex_cmd>` —
+passwordless key auth (`ssh_identity` in packages.json) and, if the reindex command
+itself needs `sudo`, a NOPASSWD entry for that one command on the remote host are
+both on you to have set up; this module doesn't manage either.
+
 ## Layout
 
 ```
 armamentarium/
   armamentarium/
     __init__.py
-    cli.py           # `armamentarium dock/undock/roaming/desktop/list/router ...` entry
+    cli.py           # `armamentarium dock/undock/roaming/desktop/list/router/fleet/config/packages ...` entry
     dock.py          # session dock: discover local device, plan, rewrite, apply; session scan
     roaming.py       # checkout ledger + undock (cross-machine coordination on Substrate)
     desktop.py       # optional config-driven Claude Desktop process control
+    fleet.py         # machine fleet registry (presence, master designation)
+    config_sync.py   # fleet dotfile capture/diff/deploy/status (Profectionis/arma-fleet)
+    packages.py      # below-decks package-state provider/consumer (apt/Flatpak/Snap/AppImage)
     mcp_router/
       __init__.py
       config.py      # allowlist + config loading (security boundary)
@@ -250,6 +282,7 @@ armamentarium/
     router.example.json
     dock.example.json
     desktop.example.json
+    packages.example.json
   pyproject.toml
 ```
 
@@ -261,8 +294,11 @@ docked onto another machine opens in Claude Desktop with full history and its fo
 reconnected. Runs host-side (the session tree it targets can't be reached from inside a
 sandboxed client — the gap the router closes). Cross-machine roaming — `undock` +
 checkout ledger — implemented and self-tested (checkout/hold-refusal/release/flush).
-Remaining: scheduled-task portability (separate mechanism), Avahi presence + auto
-stale-lock detection, remote router backends.
+`packages apt sync-cache` is new (2026-09-18) and not yet run against the real fleet —
+verify against haphaestus before relying on it. Remaining: scheduled-task portability
+(separate mechanism), Avahi presence + auto stale-lock detection, remote router
+backends, the rest of the `packages` surface (apt manifest capture/restore, Flatpak,
+Snap, AppImage/GearLever).
 
 ## License
 
