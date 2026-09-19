@@ -41,7 +41,7 @@ Config: ~/.config/armamentarium/packages.json, e.g.:
       "apt": {
         "host": "haphaestus",
         "remote_repo_dir": "/srv/Archivum/Horreum/fleet-offline-repo",
-        "remote_reindex_cmd": "sudo update-fleet-repo",
+        "remote_reindex_cmd": "sudo /usr/local/bin/update-fleet-repo",
         "cache_dir": "/var/cache/apt/archives",
         "ssh_identity": "~/.ssh/id_fleet_stoa"
       }
@@ -51,6 +51,20 @@ All fields optional except "host" — the rest default to the values shown
 above, which match haphaestus's current setup (fleet-repo.service serving
 that same directory flat over HTTP on :8080, per systemd unit inspected
 2026-09-18).
+
+IMPORTANT: remote_reindex_cmd's default deliberately spells out the
+reindex script's absolute path (/usr/local/bin/update-fleet-repo), not
+just "update-fleet-repo". Found the hard way 2026-09-18: haphaestus's
+sudoers grants NOPASSWD on the exact absolute path
+(`youruser ALL=(root) NOPASSWD: /usr/local/bin/update-fleet-repo`), and
+over a non-interactive ssh command sudo resolves a bare command name via
+its own secure_path before matching sudoers rules — if that resolution
+doesn't produce the literal string sudoers was given, the NOPASSWD grant
+doesn't match and sudo falls back to asking for a password, which fails
+outright with no TTY over ssh ("sudo: a terminal is required ..."). If
+you ever change what update-fleet-repo calls itself or grant NOPASSWD on
+a different string, keep this default's string identical to whatever is
+actually in sudoers.
 """
 
 from __future__ import annotations
@@ -67,7 +81,7 @@ DEFAULT_CONFIG_PATH = Path("~/.config/armamentarium/packages.json").expanduser()
 _APT_DEFAULTS = {
     "host": None,
     "remote_repo_dir": "/srv/Archivum/Horreum/fleet-offline-repo",
-    "remote_reindex_cmd": "sudo update-fleet-repo",
+    "remote_reindex_cmd": "sudo /usr/local/bin/update-fleet-repo",
     "cache_dir": "/var/cache/apt/archives",
     "ssh_identity": None,
 }
@@ -199,7 +213,10 @@ def apt_sync_cache(config_path: Optional[Path] = None, dry_run: bool = False,
     if reindex.returncode != 0:
         raise PackagesError(
             f"debs synced to {host}, but reindex failed (exit {reindex.returncode}):\n"
-            f"{result.reindex_output}"
+            f"{result.reindex_output}\n"
+            f"note: if this is 'a terminal is required'/'a password is required', "
+            f"remote_reindex_cmd in packages.json probably doesn't match the exact "
+            f"string sudoers grants NOPASSWD on (see this module's docstring)."
         )
 
     return result
