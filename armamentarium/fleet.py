@@ -57,8 +57,34 @@ class FleetError(Exception):
 
 # ------------------------------------------------------------------ helpers
 
+def normalize_host(name: str) -> str:
+    """Canonical registry key for a machine name.
+
+    ADDED 2026-09-20. machine_id() returned socket.gethostname() raw, and enroll()
+    keyed reg["enrolled"] on it directly -- so the key was whatever the host happened
+    to call itself at that moment. When Sisyphus's hostname was corrected from
+    `Sisyphus` to `sisyphus`, re-enrolling did not UPDATE the entry, it created a
+    SECOND one: the fleet showed 4 machines for 3, with a ghost that could never come
+    back online because nothing would ever write its heartbeat again. Same for
+    heartbeats/<hostname>.json, which forked into Sisyphus.json and sisyphus.json.
+
+    Two normalizations, both load-bearing:
+      lower()        -- a hostname is case-insensitive by every relevant standard, and
+                        the display spelling belongs in display_name, which this
+                        registry already carries for exactly that purpose.
+      split(".")[0]  -- gethostname() returns the FQDN on a host configured that way,
+                        which would fork a THIRD key (`hecate.example-tailnet.ts.net`)
+                        the first time someone changed a resolver setting.
+
+    Same class as reliquary-mode's VIATICUS_POOL needing `tr '[:upper:]' '[:lower:]'`:
+    a bare hostname works on an already-lowercase host and fails silently on one that
+    is not, so it survives every test run on the machine it was written on.
+    """
+    return (name or "").strip().split(".")[0].lower()
+
+
 def machine_id() -> str:
-    return socket.gethostname()
+    return normalize_host(socket.gethostname())
 
 
 def _now() -> str:
@@ -93,7 +119,9 @@ def _heartbeat_dir() -> Path:
 
 
 def _heartbeat_path(hostname: Optional[str] = None) -> Path:
-    return _heartbeat_dir() / f"{hostname or machine_id()}.json"
+    # Normalized, or a renamed host leaves an orphan heartbeat that never goes stale
+    # in the registry's eyes but never updates either.
+    return _heartbeat_dir() / f"{normalize_host(hostname) if hostname else machine_id()}.json"
 
 
 def _atomic_write(path: Path, data: dict) -> None:
@@ -158,28 +186,69 @@ def enroll(
     as_master: bool = False,
 ) -> dict:
     """Register this machine (or `hostname`) in the shared registry."""
-    host = hostname or machine_id()
+    host = normalize_host(hostname) if hostname else machine_id()
     reg = _load_registry()
+    # display_name is left UNSET when the caller did not ask for one, so a fold below
+    # can supply the former spelling. Filled in from host as a last resort at the end.
+    # (Defaulting it to `host` here meant the fold's setdefault was always a no-op and a
+    # rename silently downgraded "Sisyphus" to "sisyphus" in the UI -- caught in test.)
     entry: dict[str, Any] = {
         "enrolled_at": _now(),
         "dock_capable": dock_capable,
-        "display_name": display_name or host,
         "hardware": hardware or {},
     }
+    if display_name:
+        entry["display_name"] = display_name
     # Preserve original enroll date if re-enrolling.
     existing = reg["enrolled"].get(host, {})
+
+    # SELF-HEALING RENAME (2026-09-20). If an entry exists that differs from `host`
+    # only by case or domain suffix, it is THIS machine under its former name -- fold
+    # it in rather than sitting beside it. Enrolling is the one moment we know for
+    # certain which machine we are, so it is the right place to repair the split.
+    # Without this the operator must hand-edit registry.json after every rename, and
+    # the ghost entry stays red forever because nothing writes its heartbeat.
+    folded = []
+    for k in list(reg["enrolled"]):
+        if k != host and normalize_host(k) == host:
+            legacy = reg["enrolled"].pop(k)
+            folded.append(k)
+            if not existing:
+                existing = legacy
+            elif "enrolled_at" in legacy:
+                # keep the EARLIEST enrollment: it is the real one
+                if "enrolled_at" not in existing or legacy["enrolled_at"] < existing["enrolled_at"]:
+                    existing["enrolled_at"] = legacy["enrolled_at"]
+            # a former spelling is a better display name than a lowercased key
+            entry.setdefault("display_name", legacy.get("display_name") or k)
+            stale_hb = _heartbeat_dir() / f"{k}.json"
+            if stale_hb.exists():
+                try:
+                    stale_hb.unlink()
+                except OSError:
+                    pass
+    if reg.get("master") and normalize_host(reg["master"]) == host:
+        reg["master"] = host          # master pointed at the old spelling
+
     if "enrolled_at" in existing:
         entry["enrolled_at"] = existing["enrolled_at"]
         entry["re_enrolled_at"] = _now()
+    for k, v in existing.items():     # do not drop fields we did not set
+        entry.setdefault(k, v)
+    entry.setdefault("display_name", host)
     reg["enrolled"][host] = entry
     if as_master or reg["master"] is None:
         reg["master"] = host
     _save_registry(reg)
-    return {"enrolled": host, "master": reg["master"], "entry": entry}
+    out = {"enrolled": host, "master": reg["master"], "entry": entry}
+    if folded:
+        out["folded_former_names"] = folded
+    return out
 
 
 def set_master(hostname: str) -> dict:
     """Designate `hostname` as the fleet master."""
+    hostname = normalize_host(hostname)
     reg = _load_registry()
     if hostname not in reg["enrolled"]:
         raise FleetError(
