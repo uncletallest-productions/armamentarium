@@ -40,6 +40,25 @@ class NoBackendError(RouterError):
     """Raised when no available backend can serve a path."""
 
 
+# Paths an agent may NEVER write or delete, whatever the root's access or any grant says.
+# git runs programs named by files here (hooks, core.fsmonitor/sshCommand in .git/config, a
+# `.git` FILE pointing gitdir: elsewhere), so writing them turns any allowed git command into
+# arbitrary code execution. The operator edits these by hand. Decided 2026-11-23 (Jerry: "both").
+PROTECTED_DIR_NAMES = {".git", ".githooks"}
+PROTECTED_DIR_PAIRS = {("tests", "hooks")}     # stoa's core.hooksPath convention
+
+
+def protected_write_reason(resolved: str) -> Optional[str]:
+    """Why ``resolved`` must never be agent-written, or None if it may be."""
+    parts = [p for p in resolved.split(os.sep) if p]
+    for i, part in enumerate(parts):
+        if part in PROTECTED_DIR_NAMES:
+            return f"{part!r} (git would execute what is written there)"
+        if i + 1 < len(parts) and (part, parts[i + 1]) in PROTECTED_DIR_PAIRS:
+            return f"'{part}/{parts[i + 1]}/' (a git hooks directory)"
+    return None
+
+
 # Registry of backend constructors, keyed by the name used in config "backends".
 _BACKEND_FACTORIES = {
     "local": LocalFilesystemBackend,
@@ -122,6 +141,13 @@ class FilesystemRouter:
                 f"path {path!r} resolves to {resolved!r}, which is outside all "
                 f"allowlisted roots. Allowed roots: {allowed}.{extra}"
             )
+        if for_write:
+            why = protected_write_reason(resolved)
+            if why:
+                raise AccessDeniedError(
+                    f"path {path!r} is inside {why}. Agents may never write or delete there, "
+                    f"with or without a grant; the operator edits these files by hand."
+                )
         if for_write and not root.writable:
             raise AccessDeniedError(
                 f"path {path!r} is under read-only root {root.raw!r}; writes/deletes are denied. "

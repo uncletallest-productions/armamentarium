@@ -21,10 +21,12 @@ front door instead, where an interactive UI actually exists to ask a person.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import time
 from enum import Enum
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 from mcp.server.fastmcp import FastMCP
@@ -38,6 +40,8 @@ from .router import (
     RouterError,
 )
 from .backends import DirEntry, StatResult
+from .config import load_elevation, local_host
+from .. import exec_policy, exec_runner
 
 mcp = FastMCP("armamentarium_fs_mcp")
 
@@ -135,6 +139,12 @@ class SearchFilesInput(BaseModel):
     contains: Optional[str] = Field(default=None, description="Optional literal substring; only files whose text contains it are returned. Binary/unreadable files are skipped.")
     max_results: int = Field(default=100, description="Cap on returned paths.", ge=1, le=2000)
     max_depth: int = Field(default=8, description="Maximum directory depth to descend from root.", ge=1, le=50)
+
+
+class ExecInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+    argv: List[str] = Field(..., description="The command as a list of separate arguments, e.g. ['git', '-C', '~/Datasets/Substrate', 'status', '-s']. Never a single shell string; there is no shell, so quoting, pipes, ;, && and $() mean nothing.", min_length=1, max_length=64)
+    host: Optional[str] = Field(default=None, description="Host to run on. Omit for this host. (Remote hosts are not available yet.)")
 
 
 # -- tools -----------------------------------------------------------------
@@ -309,6 +319,71 @@ async def arma_search_files(params: SearchFilesInput) -> str:
             params.root, params.name_glob, params.contains, params.max_results, params.max_depth
         )
         return json.dumps({"root": resolved, "backend": backend, "count": len(results), "results": results, "truncated": len(results) >= params.max_results}, indent=2)
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="arma_exec",
+    annotations={"title": "Run Allowed Command", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+async def arma_exec(params: ExecInput) -> str:
+    """Run one command, only if the operator's exec policy allows it.
+
+    The policy (~/.config/armamentarium/exec.json, operator-owned) lists every
+    allowed command shape. Anything not listed is refused with the reason, the
+    nearest rule, and -- for rules that need approval -- the exact
+    `arma-elevate exec <rule>` command the operator can run. Call
+    arma_exec_rules first to see what is allowed. Do not retry a refused
+    command in a different form to get around a rule; ask the operator.
+
+    Args:
+        params (ExecInput):
+            - argv (list[str]): program and arguments, one list element each
+            - host (str|None): omit for this host
+
+    Returns:
+        str: JSON {"allowed", "reason", "rule", "exit_code", "stdout", "stderr",
+        "truncated", "timed_out", "duration_ms", "ran", "hint"?}. allowed=true
+        with a nonzero exit_code means the command ran and failed; read stderr.
+    """
+    try:
+        result = await asyncio.to_thread(exec_runner.execute, params.argv, params.host)
+        return result.to_json()
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="arma_exec_rules",
+    annotations={"title": "List Allowed Commands", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+async def arma_exec_rules() -> str:
+    """List the exec policy: every allowed command shape, and active exec grants.
+
+    Each rule shows its argv prefix (literals, a|b choices, {type} slots,
+    {path:ROOT} slots), allowed options, positional args, whether it runs
+    always or needs an operator grant, and which hosts it applies to.
+
+    Returns:
+        str: JSON {"policy", "host", "roots", "rules": [...], "active_exec_grants": [...]}
+        or "Error: <reason>" if the policy is missing or malformed (then nothing can run).
+    """
+    try:
+        pol = exec_policy.load_policy()
+        now = time.time()
+        grants = [{"rule": g["rule"], "expires_in_seconds": int(g["expires_at"] - now)}
+                  for g in load_elevation().grants if g.get("kind") == "exec"]
+        return json.dumps({
+            "policy": pol.source, "host": local_host(),
+            "roots": {n: {"patterns": r.patterns, "resolve": r.resolve} for n, r in pol.roots.items()},
+            "rules": [{"name": r.name, "mode": r.mode, "argv": r.argv, "options": r.options,
+                       "args": r.args, "hosts": r.hosts, "sudo": r.sudo,
+                       "description": r.description} for r in pol.rules.values()],
+            "active_exec_grants": grants,
+        }, indent=2)
+    except exec_policy.PolicyError as e:
+        return f"Error: {e}"
     except Exception as e:  # noqa: BLE001
         return _handle_error(e)
 

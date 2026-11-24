@@ -70,9 +70,9 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 EXEC_PATH = Path("~/.config/armamentarium/exec.json").expanduser()
 
@@ -158,6 +158,17 @@ def load_policy(path: Optional[Path] = None) -> Policy:
     else and should be told).
     """
     p = Path(path) if path else EXEC_PATH
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        raise PolicyError(f"no exec policy at {p}: nothing may run until the operator writes one")
+    except OSError as exc:
+        raise PolicyError(f"exec policy {p} unreadable: {exc}") from exc
+    if st.st_uid != os.geteuid():
+        raise PolicyError(f"exec policy {p} is not owned by the user running the router; refusing")
+    if st.st_mode & 0o022:
+        raise PolicyError(f"exec policy {p} is group/world-writable (mode {st.st_mode & 0o777:o}); "
+                          f"refusing. Fix: chmod 0644 {p}")
     try:
         data = json.loads(p.read_text())
     except FileNotFoundError:

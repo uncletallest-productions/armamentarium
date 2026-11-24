@@ -245,6 +245,16 @@ class ValidationTests(Base):
         with self.assertRaises(PolicyError):
             load_policy(p)
 
+    def test_writable_policy_refused(self):
+        p = self.root / "loose.json"
+        p.write_text(json.dumps({"version": 1, "rules": {"a": {"argv": ["ls"]}}}))
+        p.chmod(0o666)
+        with self.assertRaises(PolicyError) as cm:
+            load_policy(p)
+        self.assertIn("world-writable", str(cm.exception))
+        p.chmod(0o644)
+        load_policy(p)
+
     def test_unknown_key(self):
         self.bad({"r": {"argv": ["ls"], "opitons": {}}}, contains="opitons")
 
