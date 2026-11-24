@@ -334,10 +334,20 @@ def cmd_config(args: argparse.Namespace) -> int:
         elif args.config_cmd == "diff":
             print(json.dumps(config_sync.diff(args.host_a, args.host_b).as_dict(), indent=2))
         elif args.config_cmd == "deploy":
-            result = config_sync.deploy(host=args.host, force=args.force)
+            plan = config_sync.plan_deploy(host=args.host, force=args.force)
+            if args.json:
+                print(json.dumps(plan.as_dict(), indent=2))
+            else:
+                print(config_sync.render_plan(plan))
+            if not args.apply:
+                if not args.json:
+                    print("\n(dry run, nothing written. Re-run with --apply, at a terminal, "
+                          "to write.)")
+                return 1 if plan.by_action("refused") else 0
+            print()
+            result = config_sync.apply_deploy(plan)
             print(json.dumps(result, indent=2))
-            if result["refused_drift"]:
-                return 1
+            return 1 if (plan.by_action("refused") or result["skipped_changed_since_plan"]) else 0
         elif args.config_cmd == "status":
             print(json.dumps(config_sync.status(host=args.host), indent=2))
         elif args.config_cmd == "untrack":
@@ -533,6 +543,11 @@ def build_parser() -> argparse.ArgumentParser:
     cfgdp = cfgsub.add_parser("deploy", help="restore this host's tracked files from the store (self-heal/rollback)")
     cfgdp.add_argument("--host", help="override hostname (default: this machine; another host = deliberate manual clone)")
     cfgdp.add_argument("--force", action="store_true", help="overwrite even where the live file has uncaptured edits")
+    cfgdp.add_argument("--apply", action="store_true",
+                       help="actually write (default: dry-run plan with diffs). Needs a terminal: "
+                            "y/N for the set, and the file name typed for code-running files. "
+                            "Policy files (armamentarium/exec.json, router.json) are never written.")
+    cfgdp.add_argument("--json", action="store_true", help="print the plan as JSON")
     cfgdp.set_defaults(func=cmd_config)
 
     cfgs = cfgsub.add_parser("status", help="tracked/captured counts, last capture time, live-vs-store drift")

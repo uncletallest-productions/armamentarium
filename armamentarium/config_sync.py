@@ -50,21 +50,26 @@ Design invariants carried over from the original decision:
     deletes, and refuses per-file on live/manifest hash mismatch unless
     forced (protects an uncaptured hand-edit from being silently clobbered
     by a stale manifest).
+  - 2026-11-24: the store is AGENT-WRITABLE, so deploy is a dry-run plan by default;
+    writing needs --apply at a real terminal + y/N, code-running files need their name
+    typed, and armamentarium/{exec,router}.json are never written (see POLICY_FILES).
 """
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
+from pathlib import Path, PurePosixPath
+from typing import Callable, Optional
 
 # Store location. 2026-09-11 (operator decision): the store moves to
 # Mechanicum/Profectionis, mounted at ~/Datasets/Profectionis, and Continuatus
@@ -106,6 +111,26 @@ DEFAULT_ROOT = resolve_store_root()
 RUNTIME_STATE_EXCLUDE = {
     "stoa/sensor-registry.json",
 }
+
+# ---- deploy trust model (2026-11-24, domain1-arma-exec "deploy trust hole") ----------------
+# The store (tracked.txt, manifest.json, the mirrored copies) lives under ~/Datasets, which
+# agents can WRITE. Deploy installs store content into ~/.config, where several files run code
+# (login autostart, user units, MCP server commands, arma's own policy). So deploy must never
+# trust the store: it is a dry-run plan by default, --apply needs a real terminal and a y/N,
+# code-running files additionally need their file name typed, and the two policy files are
+# never written at all (diff + a reviewed-snapshot install command instead).
+
+# Never written by deploy, even with --apply: they decide what agents may do.
+POLICY_FILES = {"armamentarium/exec.json", "armamentarium/router.json"}
+# Never captured or deployed: runtime grants, host-local by design.
+NEVER_SYNC = {"armamentarium/elevate.json"}
+# Files that run commands (at login, on activation, or as configured programs). Best effort:
+# every change is diffed in the plan anyway; these also need the file name typed to apply.
+CODE_RUNNER_EXACT = {"Claude/claude_desktop_config.json"}
+CODE_RUNNER_PREFIXES = ("labwc/", "kanshi/", "systemd/", "autostart/", "environment.d/")
+# Reviewed snapshots for policy files live where no agent root reaches.
+REVIEW_DIR = Path("~/.local/state/armamentarium/deploy-review").expanduser()
+DIFF_MAX_LINES = 400
 
 
 class ConfigSyncError(Exception):
@@ -150,6 +175,35 @@ def _atomic_copy(src: Path, dest: Path) -> None:
 def _config_home(home: Path) -> Path:
     """The live root relpaths are resolved against: ~/.config, not ~."""
     return home / ".config"
+
+
+def _within(path: Path, base: Path) -> bool:
+    """True if ``path`` (after resolving symlinks in it) is ``base`` or below it."""
+    p, b = os.path.realpath(path), os.path.realpath(base)
+    return p == b or p.startswith(b.rstrip(os.sep) + os.sep)
+
+
+def unsafe_relpath(relpath: str) -> Optional[str]:
+    """Why ``relpath`` may not be synced, or None. tracked.txt and manifest.json are
+    agent-writable, so a line like '../.ssh/id_ed25519' must not escape ~/.config."""
+    if not relpath or relpath != relpath.strip():
+        return "empty or padded path"
+    p = PurePosixPath(relpath)
+    if p.is_absolute():
+        return "absolute path"
+    if ".." in p.parts or "." in p.parts:
+        return "path contains '..' or '.'"
+    if relpath in NEVER_SYNC:
+        return "runtime grants file, never synced"
+    return None
+
+
+def is_code_runner(relpath: str, data: Optional[bytes] = None, mode: Optional[int] = None) -> bool:
+    if relpath in CODE_RUNNER_EXACT or relpath.startswith(CODE_RUNNER_PREFIXES):
+        return True
+    if data is not None and data[:2] == b"#!":
+        return True
+    return bool(mode is not None and mode & 0o111)
 
 
 # ------------------------------------------------------------------ paths
@@ -201,20 +255,26 @@ def _save_manifest(data: dict, host: Optional[str] = None, root: Path = DEFAULT_
     _atomic_write_bytes(p, json.dumps(data, indent=2).encode())
 
 
-def _git_commit_best_effort(root: Path, message: str) -> Optional[str]:
+def _git_commit_best_effort(root: Path, message: str,
+                            paths: Optional[list[str]] = None) -> Optional[str]:
     """Best-effort git add+commit in the store. Never raises — a missing git
     binary or a store that isn't a repo yet shouldn't block a capture.
 
     Returns the new commit's short SHA on success, or a human-readable note
     explaining why nothing was committed. 2026-09-11: it used to return None on
     success, so a perfectly good capture reported `"commit": null` and read like
-    a failure (it isn't — the commit was there all along)."""
+    a failure (it isn't — the commit was there all along).
+
+    2026-11-24: ``paths`` (store-relative) limits BOTH staging and the commit to those paths.
+    It used to `add -A` the whole store, so an unrelated uncommitted edit landed in a
+    commit labelled "capture: <host>" (seen: sisyphus/tracked.txt inside defcaba)."""
     try:
         if not (root / ".git").is_dir():
             return "not a git repo — skipped commit"
-        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True,
+        scope = ["--", *paths] if paths else []
+        subprocess.run(["git", "-C", str(root), "add", "-A", *scope], check=True,
                         capture_output=True, timeout=15)
-        result = subprocess.run(["git", "-C", str(root), "commit", "-m", message],
+        result = subprocess.run(["git", "-C", str(root), "commit", "-m", message, *scope],
                                  capture_output=True, timeout=15, text=True)
         if result.returncode != 0:
             # commonly "nothing to commit" — not an error
@@ -237,14 +297,23 @@ def capture(host: Optional[str] = None, root: Path = DEFAULT_ROOT,
     home = home or Path.home()
     tracked = read_tracked(host, root)
     manifest = load_manifest(host, root)
-    synced, skipped = [], []
+    synced, skipped, refused = [], [], []
 
     for relpath in tracked:
+        why = unsafe_relpath(relpath)
         src = _config_home(home) / relpath
+        if why is None and not _within(src, _config_home(home)):
+            why = "resolves outside ~/.config (symlink)"
+        if why:
+            refused.append({"path": relpath, "reason": why})
+            continue
         if not src.is_file():
             skipped.append(relpath)
             continue
-        dest = mirror_root(host, root) / relpath.lstrip("/")
+        dest = mirror_root(host, root) / relpath
+        if not _within(dest.parent, mirror_root(host, root)):   # before mkdir: no dirs via a link
+            refused.append({"path": relpath, "reason": "mirror dir resolves outside the store"})
+            continue
         _atomic_copy(src, dest)
         manifest["files"][relpath] = {
             "updated": _now(),
@@ -255,12 +324,14 @@ def capture(host: Optional[str] = None, root: Path = DEFAULT_ROOT,
 
     _save_manifest(manifest, host, root)
     commit_note = _git_commit_best_effort(
-        root, f"capture: {host} ({len(synced)} file(s))"
+        root, f"capture: {host} ({len(synced)} file(s))",
+        paths=[str(host_dir(host, root).relative_to(root))],
     )
     return {
         "host": host,
         "synced": synced,
         "skipped_missing": skipped,
+        "refused_unsafe": refused,
         "commit": commit_note,
     }
 
@@ -312,55 +383,211 @@ def diff(host_a: str, host_b: str, root: Path = DEFAULT_ROOT) -> DiffResult:
 
 # ------------------------------------------------------------------ deploy (self-restore/rollback)
 
-def deploy(host: Optional[str] = None, root: Path = DEFAULT_ROOT,
-           home: Optional[Path] = None, force: bool = False) -> dict:
-    """Restore this host's own tracked files from the store back onto itself
-    — a rollback/self-heal operation (last-known-good from the store), NOT a
-    live-to-live push. `host` should normally be left as this machine;
-    passing another host's name is a deliberate, manual clone of that host's
-    config onto this one and is on the caller to intend.
+@dataclass
+class PlanEntry:
+    path: str
+    action: str            # unchanged | create | update | policy | refused | missing_mirror
+    reason: str = ""
+    code_runner: bool = False
+    diff: str = ""
+    review_cmd: str = ""   # policy files: the install command for the reviewed snapshot
+    data: Optional[bytes] = field(default=None, repr=False)   # EXACT bytes that would be written
+    live_sha: Optional[str] = None                             # live hash at plan time
 
-    Refuses (per-file, not whole-run) when the live file's current hash
-    doesn't match what's on record for it — that means the live file has
-    uncaptured edits, and deploying over it would silently lose them. Pass
-    force=True to overwrite anyway (still takes a .bak first)."""
+    def as_dict(self) -> dict:
+        d = {"path": self.path, "action": self.action, "code_runner": self.code_runner}
+        for k in ("reason", "diff", "review_cmd"):
+            if getattr(self, k):
+                d[k] = getattr(self, k)
+        return d
+
+
+@dataclass
+class DeployPlan:
+    host: str
+    home: Path
+    entries: list[PlanEntry] = field(default_factory=list)
+
+    def by_action(self, *actions: str) -> list[PlanEntry]:
+        return [e for e in self.entries if e.action in actions]
+
+    def as_dict(self) -> dict:
+        return {"host": self.host, "entries": [e.as_dict() for e in self.entries]}
+
+
+def _diff_text(old: Optional[bytes], new: bytes, relpath: str) -> str:
+    if (old and b"\0" in old) or b"\0" in new:
+        return f"(binary: {len(old or b'')} -> {len(new)} bytes)"
+    a = (old or b"").decode("utf-8", "replace").splitlines(keepends=True)
+    b = new.decode("utf-8", "replace").splitlines(keepends=True)
+    lines = list(difflib.unified_diff(a, b, f"live/{relpath}", f"store/{relpath}"))
+    if len(lines) > DIFF_MAX_LINES:
+        lines = lines[:DIFF_MAX_LINES] + [f"... ({len(lines) - DIFF_MAX_LINES} more diff lines)\n"]
+    return "".join(lines)
+
+
+def plan_deploy(host: Optional[str] = None, root: Path = DEFAULT_ROOT,
+                home: Optional[Path] = None, force: bool = False) -> DeployPlan:
+    """Work out what deploy WOULD do. Writes nothing (except reviewed snapshots of
+    changed policy files under REVIEW_DIR, which is outside every agent root).
+
+    The store is agent-writable, so nothing in it is trusted: every entry must be in BOTH
+    the manifest and tracked.txt, have a safe relpath that stays inside ~/.config, and come
+    from a regular (non-symlink) file inside the mirror. The bytes read here are the bytes
+    apply_deploy writes, so the store can't change between review and write.
+
+    Drift rule kept from v1: a live file whose hash differs from the manifest has uncaptured
+    edits and is refused unless force=True. NB that check does NOT detect a tampered
+    store (an attacker leaves the manifest alone); the diff and the confirmations do."""
     host = host or machine_id()
     home = home or Path.home()
-    manifest = load_manifest(host, root)
-    deployed, refused, restored_missing = [], [], []
+    cfg_home = _config_home(home)
+    mroot = mirror_root(host, root)
+    tracked = set(read_tracked(host, root))
+    plan = DeployPlan(host=host, home=home)
 
-    for relpath, meta in manifest["files"].items():
-        src = mirror_root(host, root) / relpath.lstrip("/")
-        if not src.is_file():
-            continue  # manifest says tracked, mirror missing — nothing to deploy for this one
-        dest = _config_home(home) / relpath
+    for relpath, meta in sorted(load_manifest(host, root)["files"].items()):
+        e = PlanEntry(path=relpath, action="refused", code_runner=is_code_runner(relpath))
+        plan.entries.append(e)
+        why = unsafe_relpath(relpath)
+        if why:
+            e.reason = why
+            continue
+        if relpath not in tracked:
+            e.reason = "in manifest.json but not in tracked.txt"
+            continue
+        src, dest = mroot / relpath, cfg_home / relpath
+        if not _within(dest.parent, cfg_home):
+            e.reason = "destination resolves outside ~/.config (symlink)"
+            continue
+        if not src.exists() and not src.is_symlink():
+            e.action, e.reason = "missing_mirror", "no mirrored copy in the store"
+            continue
+        if src.is_symlink() or not src.is_file() or not _within(src, mroot):
+            e.reason = "store copy is a symlink, not a regular file, or outside the store"
+            continue
+        data = src.read_bytes()
+        e.data = data
+        e.code_runner = is_code_runner(relpath, data, src.stat().st_mode)
+        live = dest.read_bytes() if dest.is_file() else None
+        e.live_sha = hashlib.sha256(live).hexdigest() if live is not None else None
 
-        if dest.exists() and not force:
-            live_hash = _sha256(dest)
-            if live_hash != meta.get("sha256"):
-                refused.append(relpath)
+        if live is not None and not force and e.live_sha != meta.get("sha256"):
+            e.reason = ("live file has uncaptured edits (hash differs from manifest): "
+                        "run `capture` first, or --force to discard them")
+            e.diff = _diff_text(live, data, relpath)
+            continue
+        if live == data:
+            e.action = "unchanged"
+            continue
+        e.diff = _diff_text(live, data, relpath)
+        if relpath in POLICY_FILES:
+            e.action = "policy"
+            sha = hashlib.sha256(data).hexdigest()
+            snap = REVIEW_DIR / f"{relpath.replace('/', '__')}.{sha[:12]}"
+            _atomic_write_bytes(snap, data)
+            os.chmod(snap, 0o600)
+            e.reason = ("policy file: deploy never writes it. Read the diff; if it is right, "
+                        "install the reviewed snapshot (same bytes as the diff):")
+            e.review_cmd = f"install -m 0644 {snap} {dest}"
+            continue
+        e.action = "update" if live is not None else "create"
+    return plan
+
+
+def render_plan(plan: DeployPlan, show_diffs: bool = True) -> str:
+    out = [f"deploy plan for {plan.host} -> {_config_home(plan.home)}"]
+    marks = {"unchanged": "=", "create": "+", "update": "~", "policy": "!",
+             "refused": "x", "missing_mirror": "?"}
+    for e in plan.entries:
+        tag = " [runs code: type its name to apply]" if e.code_runner and e.action in (
+            "create", "update") else ""
+        out.append(f"  {marks.get(e.action, ' ')} {e.action:14} {e.path}{tag}")
+        if e.reason:
+            out.append(f"      {e.reason}")
+        if e.review_cmd:
+            out.append(f"      {e.review_cmd}")
+    if show_diffs:
+        for e in plan.entries:
+            if e.diff and e.action != "unchanged":
+                out.append("")
+                out.append(e.diff.rstrip("\n"))
+    pending = plan.by_action("create", "update")
+    out.append("")
+    out.append(f"{len(pending)} file(s) would be written; "
+               f"{len(plan.by_action('policy'))} policy file(s) need a manual install; "
+               f"{len(plan.by_action('refused'))} refused.")
+    return "\n".join(out)
+
+
+def _default_isatty() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def apply_deploy(plan: DeployPlan, prompt: Callable[[str], str] = input,
+                 out: Callable[[str], None] = print,
+                 isatty: Callable[[], bool] = _default_isatty) -> dict:
+    """Write a plan's create/update entries, only with a human at a terminal.
+
+    One y/N (default No) for the whole set, then for each code-running file its diff again
+    and the file NAME typed back. Policy and refused entries are never written. Each write:
+    live file re-hashed (skip if it changed since the plan), .bak-<ts> taken, atomic
+    replace with the PLANNED bytes, existing mode kept (new files 0644, never the store's
+    mode, so an exec bit can't ride in from the store)."""
+    if not isatty():
+        raise ConfigSyncError(
+            "refusing to apply: no terminal. deploy --apply needs a human to confirm "
+            "(stdin and stdout must be a tty); run it yourself in a shell.")
+    pending = plan.by_action("create", "update")
+    result = {"host": plan.host, "applied": [], "skipped_by_operator": [],
+              "skipped_changed_since_plan": [], "aborted": False}
+    if not pending:
+        out("nothing to apply.")
+        return result
+    answer = prompt(f"Write {len(pending)} file(s) into {_config_home(plan.home)}? [y/N] ")
+    if answer.strip().lower() not in ("y", "yes"):
+        result["aborted"] = True
+        out("aborted, nothing written.")
+        return result
+    cfg_home = _config_home(plan.home)
+    for e in pending:
+        if e.code_runner:
+            name = PurePosixPath(e.path).name
+            out("")
+            out(e.diff.rstrip("\n") or f"(new file {e.path})")
+            typed = prompt(f"{e.path} can run code. Type '{name}' to write it "
+                           f"(anything else skips): ")
+            if typed.strip() != name:
+                result["skipped_by_operator"].append(e.path)
+                out(f"  skipped {e.path}")
                 continue
-
-        if dest.exists():
+        dest = cfg_home / e.path
+        now = dest.read_bytes() if dest.is_file() else None
+        now_sha = hashlib.sha256(now).hexdigest() if now is not None else None
+        if now_sha != e.live_sha or not _within(dest.parent, cfg_home):
+            result["skipped_changed_since_plan"].append(e.path)
+            out(f"  skipped {e.path}: changed since the plan was made; re-run deploy")
+            continue
+        mode = 0o644
+        if now is not None:
+            mode = dest.stat().st_mode & 0o7777
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            backup = dest.with_name(dest.name + f".bak-{stamp}")
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(dest, backup)
-        else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            restored_missing.append(relpath)
+            shutil.copy2(dest, dest.with_name(dest.name + f".bak-{stamp}"))
+        _atomic_write_bytes(dest, e.data)
+        os.chmod(dest, mode)
+        result["applied"].append(e.path)
+        out(f"  wrote {e.path}")
+    return result
 
-        _atomic_copy(src, dest)
-        deployed.append(relpath)
 
-    return {
-        "host": host,
-        "deployed": deployed,
-        "restored_missing": restored_missing,
-        "refused_drift": refused,
-        "note": ("refused files had live edits not yet captured — run `capture` "
-                 "first, or re-run with force=True to discard them") if refused else None,
-    }
+def deploy(host: Optional[str] = None, root: Path = DEFAULT_ROOT,
+           home: Optional[Path] = None, force: bool = False) -> dict:
+    """Compatibility wrapper: returns the PLAN only (dry run), never writes ~/.config.
+    Writing goes through apply_deploy(), which needs a terminal. v1 wrote immediately."""
+    return plan_deploy(host, root, home, force).as_dict()
 
 
 # ------------------------------------------------------------------ adopt (onboard pre-existing mirror content)
