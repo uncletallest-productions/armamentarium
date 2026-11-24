@@ -26,6 +26,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -45,7 +46,9 @@ PASS_ENV = ("HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR",
 GIT_HARDEN = [
     "-c", "core.fsmonitor=false",              # status/diff would run it
     "-c", f"core.hooksPath={APPROVED_HOOKS}",  # never the repo's own hooks
-    "-c", "core.sshCommand=ssh",               # fetch/push would run a repo-set one
+    # fetch/push would run a repo-set ssh command; ours never prompts (no tty to answer it),
+    # never starts a lingering ControlMaster, and gives up on a dead route
+    "-c", "core.sshCommand=ssh -o BatchMode=yes -o ControlMaster=no -o ConnectTimeout=15",
     "-c", "protocol.ext.allow=never",          # ext:: remotes run arbitrary commands
     "--no-pager",
 ]
@@ -107,8 +110,39 @@ def _log(entry: dict) -> None:
         pass
 
 
-def _clip(b: bytes, cap: int):
-    return b[:cap].decode("utf-8", "replace"), len(b) > cap
+READ_GRACE = 3.0   # seconds to let output drain after the process itself has exited
+
+
+class _Reader(threading.Thread):
+    """Drain one pipe, keeping at most ``cap`` bytes. Always reads to EOF (so the child can never
+    block on a full pipe) but never stores more than the cap."""
+
+    def __init__(self, pipe, cap: int):
+        super().__init__(daemon=True)
+        self.pipe, self.cap, self.buf, self.total = pipe, cap, bytearray(), 0
+
+    def run(self):
+        try:
+            while True:
+                chunk = self.pipe.read1(65536) if hasattr(self.pipe, "read1") else self.pipe.read(65536)
+                if not chunk:
+                    break
+                self.total += len(chunk)
+                room = self.cap - len(self.buf)
+                if room > 0:
+                    self.buf += chunk[:room]
+        except (OSError, ValueError):
+            pass
+
+    def text(self):
+        return bytes(self.buf).decode("utf-8", "replace"), self.total > self.cap
+
+
+def _killpg(pid: int, sig=signal.SIGKILL) -> None:
+    try:
+        os.killpg(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def execute(argv: List[str], host: Optional[str] = None,
@@ -154,36 +188,59 @@ def execute(argv: List[str], host: Optional[str] = None,
     entry.update(allowed=True, rule=d.rule, mode=d.mode, ran=run,
                  grant_expires_at=(d.grant or {}).get("expires_at"))
     timed_out = False
+    abandoned = False
     try:
         proc = subprocess.Popen(run, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, cwd="/", env=_env(),
                                 start_new_session=True)
-        try:
-            out, err = proc.communicate(timeout=d.timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            out, err = proc.communicate()
     except OSError as exc:
         entry.update(error=str(exc))
         _log(entry)
         return ExecResult(False, f"failed to start {prog}: {exc}", rule=d.rule, ran=run)
-
-    so, t1 = _clip(out, d.max_output)
-    se, t2 = _clip(err, d.max_output)
+    readers = [_Reader(proc.stdout, d.max_output), _Reader(proc.stderr, d.max_output)]
+    for r in readers:
+        r.start()
+    # Wait for the PROCESS, not for EOF on its pipes: a helper that detaches (ssh ProxyCommand,
+    # a daemonising child) can hold the pipes open forever after the command itself is done.
+    try:
+        proc.wait(timeout=d.timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _killpg(proc.pid)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    deadline = time.time() + READ_GRACE
+    for r in readers:
+        r.join(max(0.0, deadline - time.time()))
+    if any(r.is_alive() for r in readers):
+        # stragglers still hold the pipes: clean up our own process group, then stop waiting
+        _killpg(proc.pid)
+        for r in readers:
+            r.join(1.0)
+        abandoned = any(r.is_alive() for r in readers)
+    (so, t1), (se, t2) = readers[0].text(), readers[1].text()
+    if not abandoned:
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                pass
     ms = int((time.time() - t0) * 1000)
     reason = d.reason
     if timed_out:
         reason += f"; KILLED after {d.timeout}s timeout"
-    elif proc.returncode != 0:
+    if abandoned:
+        reason += ("; a detached child kept the output pipes open after the command ended -- "
+                   "output may be incomplete")
+    if not timed_out and proc.returncode not in (0, None):
         reason += f"; exited {proc.returncode}"
-        if d.sudo and b"password is required" in err:
+        if d.sudo and "password is required" in se:
             reason += (" -- sudo has no NOPASSWD entry for this command; the operator must add "
                        "one (no blanket sudo)")
-    entry.update(exit=proc.returncode, duration_ms=ms, truncated=t1 or t2, timed_out=timed_out)
+    entry.update(exit=proc.returncode, duration_ms=ms, truncated=t1 or t2, timed_out=timed_out,
+                 abandoned_pipes=abandoned)
     _log(entry)
     return ExecResult(True, reason, rule=d.rule, exit_code=proc.returncode, stdout=so, stderr=se,
                       truncated=t1 or t2, timed_out=timed_out, duration_ms=ms, ran=run)

@@ -162,6 +162,54 @@ class RunnerTests(RunnerBase):
         self.assertLess(len(self.logged()[-1]["argv"][-1]), 300)
 
 
+class DetachedChildTests(RunnerBase):
+    """A helper that leaves a detached child holding stdout/stderr open (the ssh ProxyCommand
+    case) must not hang the runner -- neither on success nor after a timeout."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.t / "bin"
+        self.bin.mkdir()
+        for name, body in {
+            "leaky-ok": "(setsid sleep 30 &)\necho done\n",
+            "leaky-slow": "(setsid sleep 30 &)\nsleep 30\n",
+            "noisy": "head -c 300000 /dev/zero | tr '\\0' x\necho\n",
+        }.items():
+            f = self.bin / name
+            f.write_text("#!/bin/sh\n" + body)
+            f.chmod(0o755)
+        pol = json.loads(self.policy.read_text())
+        pol["rules"].update({
+            "leaky-ok": {"mode": "always", "argv": ["leaky-ok"], "timeout": 20},
+            "leaky-slow": {"mode": "always", "argv": ["leaky-slow"], "timeout": 2},
+            "noisy": {"mode": "always", "argv": ["noisy"], "max_output": 1000},
+        })
+        self.policy.write_text(json.dumps(pol))
+        self.policy.chmod(0o644)
+        p = mock.patch.object(exec_runner, "SAFE_PATH", f"{self.bin}:{SAFE_PATH}")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_detached_child_after_success(self):
+        t0 = time.time()
+        r = self.run_(["leaky-ok"])
+        self.assertLess(time.time() - t0, 10, "runner waited on a detached child's pipes")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("done", r.stdout)
+
+    def test_detached_child_after_timeout(self):
+        t0 = time.time()
+        r = self.run_(["leaky-slow"])
+        self.assertLess(time.time() - t0, 15, "runner hung after the timeout kill")
+        self.assertTrue(r.timed_out)
+
+    def test_big_output_drained_and_capped(self):
+        r = self.run_(["noisy"])
+        self.assertEqual(r.exit_code, 0)
+        self.assertTrue(r.truncated)
+        self.assertEqual(len(r.stdout), 1000)
+
+
 class GitHardeningTests(RunnerBase):
     def setUp(self):
         super().setUp()
