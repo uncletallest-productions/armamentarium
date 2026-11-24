@@ -21,6 +21,35 @@ every grant ends.**
 > Status: v0.1, in daily use on a small Debian fleet. Linux only. Single operator.
 > See [Status](#status) for what is and isn't done.
 
+### The setup it grew up in
+
+armamentarium was built for one homelab, and most of it assumes that lab's storage
+shape, so it helps to know it:
+
+- **One ZFS pool on a home server holds everything that matters,** split into datasets
+  by purpose (code, agent memory, fleet config, archives, media). Each dataset is
+  exported over NFS.
+- **Every machine mounts the datasets it uses as leaves under `~/Datasets/<Name>`.**
+  Mounts go over the LAN first, with the tailnet as a fallback. So the same path
+  works on every machine, wherever the machine is.
+- **Laptops carry local ZFS copies of a curated subset** for travel. They work
+  offline against those, and the changes are replayed back to the server on return.
+- **Shared state lives in those datasets.** The fleet-config store
+  (`~/Datasets/Profectionis/fleet-config`, a git repo), the session-roaming ledger, and
+  the machine registry are all on NFS. That's why the defaults below point at
+  `~/Datasets/...`, and why so much of this tool is about trusting (or not trusting)
+  shared storage. Every default can be overridden. Point them wherever your shared
+  storage lives, or at a plain local directory.
+
+The Latin names (*Profectionis*, *Horreum*, *Viaticus*…) follow a naming scheme
+explained in [docs/NAMING.md](docs/NAMING.md). You don't need any of it to use the tool.
+
+armamentarium is also the engine behind two hubs in **Stoa**, the author's labwc/Wayland
+desktop shell: **Oraculum** (Claude Desktop sessions: docking, roaming, start/stop)
+and **Aerarium** (the dataset working set: mount state and offline mode), whose mount
+registry travels between machines through `arma config`. Stoa isn't required.
+armamentarium is a standalone CLI and MCP server.
+
 ---
 
 ## Contents
@@ -92,8 +121,14 @@ Ubuntu) that's the only sane option, and it keeps the MCP dependency tree away f
 apt's Python.
 
 ```bash
-git clone <this repo> ~/src/armamentarium
 python3 -m venv ~/.venvs/armamentarium
+~/.venvs/armamentarium/bin/pip install git+https://github.com/uncletallest-productions/armamentarium
+```
+
+Or from a clone, which you'll want anyway for `bin/arma-grant` and the example configs:
+
+```bash
+git clone https://github.com/uncletallest-productions/armamentarium ~/src/armamentarium
 ~/.venvs/armamentarium/bin/pip install ~/src/armamentarium
 ```
 
@@ -406,6 +441,8 @@ armamentarium/
     arma-elevate -> arma-grant
     arma-revoke  -> arma-grant
   config/            # *.example.json + optional config-watch unit
+  docs/
+    NAMING.md        # the Latin naming scheme (shared across repos)
   tests/
   pyproject.toml
 ```
