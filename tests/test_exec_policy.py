@@ -56,6 +56,7 @@ class Base(unittest.TestCase):
     def make(self, data):
         p = self.root / "exec.json"
         p.write_text(json.dumps(data))
+        p.chmod(0o644)   # independent of the caller's umask (002 makes it group-writable)
         return load_policy(p)
 
     def ok(self, argv, host=HOST, grants=()):
@@ -239,9 +240,11 @@ class ValidationTests(Base):
     def test_bad_json_and_version(self):
         p = self.root / "x.json"
         p.write_text("{")
+        p.chmod(0o644)
         with self.assertRaises(PolicyError):
             load_policy(p)
         p.write_text(json.dumps({"version": 2, "rules": {"a": {"argv": ["ls"]}}}))
+        p.chmod(0o644)
         with self.assertRaises(PolicyError):
             load_policy(p)
 

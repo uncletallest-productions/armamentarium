@@ -54,6 +54,7 @@ class RunnerBase(unittest.TestCase):
                 "git-commit": {"mode": "always", "argv": ["git", "-C", "{path:git}", "commit"],
                                "options": {"-m": "{text}"}},
             }}))
+        self.policy.chmod(0o644)   # independent of the caller's umask
 
     def tearDown(self):
         for p in reversed(self.patches):
