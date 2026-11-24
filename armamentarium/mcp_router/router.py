@@ -78,11 +78,21 @@ class FilesystemRouter:
     def resolve(self, path: str, *, for_write: bool = False) -> Tuple[str, Root]:
         """Resolve ``path`` to a canonical form and enforce the allowlist.
 
-        Checks the base config first, then falls back to a time-boxed
-        elevation grant (``elevate.json``, if present and unexpired) — see
-        ``config.load_elevation``. Elevation is consulted fresh on every
-        call, never cached, so a manual revoke or a natural expiry takes
-        effect on the very next operation, not just after a restart.
+        Base config first, then time-boxed elevation grants (``elevate.json``),
+        consulted in exactly two cases:
+
+        * the path matches NO base root  -> elevation can ADD a root;
+        * a WRITE matches a read-only base root -> an active rw elevation that
+          also matches can UPGRADE it for the duration of the grant.
+
+        FIXED 2026-11-23: elevation used to be consulted only in the first case,
+        so "r in router.json, arma-elevate rw for short bursts" could never work --
+        the base r root always matched first and the rw grant was never read, while
+        the refusal message told the caller to go and get exactly that grant.
+
+        Elevation never DOWNGRADES: a read, or a write to an already-rw base root,
+        never consults it. Elevation is read fresh on every call, never cached, so
+        a revoke or a natural expiry takes effect on the very next operation.
 
         Returns ``(resolved_absolute_path, matched_root)``.
 
@@ -90,19 +100,23 @@ class FilesystemRouter:
             PathNotAllowedError: path is outside every allowlisted root,
                 including any active elevation.
             AccessDeniedError: write (or delete) requested against a
-                read-only root.
+                read-only root with no active rw elevation covering it.
         """
         resolved = os.path.realpath(Path(path).expanduser())
         root = self._match_root(resolved)
         elevation = None
-        if root is None:
+        if root is None or (for_write and not root.writable):
             elevation = load_elevation()
             if elevation.active:
-                root = self._match_root(resolved, roots=elevation.roots)
+                elevated = self._match_root(resolved, roots=elevation.roots)
+                if root is None:
+                    root = elevated
+                elif elevated is not None and elevated.writable:
+                    root = elevated          # r -> rw upgrade, only for this write
         if root is None:
             allowed = ", ".join(r.raw for r in self.config.roots) or "(none configured)"
             extra = ""
-            if elevation is not None and elevation.roots and not elevation.active:
+            if elevation is not None and not elevation.active and elevation.expires_at:
                 extra = " An elevation grant exists but has expired; re-run arma-elevate if this access is still needed."
             raise PathNotAllowedError(
                 f"path {path!r} resolves to {resolved!r}, which is outside all "
@@ -111,8 +125,7 @@ class FilesystemRouter:
         if for_write and not root.writable:
             raise AccessDeniedError(
                 f"path {path!r} is under read-only root {root.raw!r}; writes/deletes are denied. "
-                f"Grant this root \"access\": \"rw\" in the router config to allow writing, "
-                f"or ask the operator to run arma-elevate for a time-boxed rw grant."
+                f"Ask the operator for a time-boxed grant: arma-elevate path {root.raw} rw <ttl>"
             )
         return resolved, root
 
@@ -174,6 +187,7 @@ class FilesystemRouter:
 
     def status(self) -> dict:
         elevation = load_elevation()
+        now = time.time()
         return {
             "config_source": self.config.source,
             "roots": [{"path": r.raw, "resolved": r.path, "access": r.access} for r in self.config.roots],
@@ -182,10 +196,19 @@ class FilesystemRouter:
                 "active": elevation.active,
                 "expires_at": elevation.expires_at,
                 "expires_in_seconds": (
-                    round(elevation.expires_at - time.time()) if elevation.active else None
+                    round(elevation.expires_at - now) if elevation.active else None
                 ),
                 "roots": [
                     {"path": r.raw, "resolved": r.path, "access": r.access} for r in elevation.roots
+                ],
+                # Every active grant (path AND exec) with its own time left -- v2 can
+                # hold several, each expiring on its own clock.
+                "grants": [
+                    {k: g.get(k) for k in ("kind", "target", "rule", "access", "host",
+                                           "granted_on", "expires_at")
+                     if g.get(k) is not None}
+                    | {"expires_in_seconds": round(g["expires_at"] - now)}
+                    for g in elevation.grants
                 ],
             },
         }

@@ -1,17 +1,1 @@
-#!/usr/bin/env bash
-# arma-revoke — immediately revoke any active armamentarium elevation grant.
-#
-# Companion to arma-elevate. Deletes ~/.config/armamentarium/elevate.json.
-# Since the router re-reads this file fresh on every request (never cached),
-# the revoke is effective on the very next tool call — no restart needed.
-
-set -euo pipefail
-
-ELEVATE_FILE="$HOME/.config/armamentarium/elevate.json"
-
-if [[ -f "$ELEVATE_FILE" ]]; then
-  rm -f "$ELEVATE_FILE"
-  echo "Revoked. elevate.json removed."
-else
-  echo "Nothing to revoke — no elevate.json present."
-fi
+arma-grant

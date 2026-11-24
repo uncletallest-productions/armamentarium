@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""arma-grant — time-boxed elevation grants for the armamentarium router (v2).
+
+Installed root-owned in /usr/local/bin and invoked through two names:
+
+    arma-elevate path <path> [r|rw] [ttl]     grant a filesystem root   (default rw, 1h)
+    arma-elevate exec <rule> [host] [ttl]     grant a named exec rule   (default 15m)
+    arma-elevate <path> [r|rw] [ttl]          v1 form, same as `path` (habits keep working)
+    arma-elevate list [expired] [--since T]   active grants; 'expired' shows the ledger
+    arma-revoke  all                          end every grant (path + exec, every host)
+    arma-revoke  path <path>                  end one path grant
+    arma-revoke  exec <rule> [host]           end one exec grant
+    arma-revoke                               refuses, and lists what is active
+
+TTL: seconds (900) or 30s / 15m / 2h / 1d. Hard cap 4h: longer is clamped, and says so.
+host: defaults to THIS host (short hostname, lowercased) -- not to any fixed machine.
+
+FILES (all under the invoking user's home -- run as YOURSELF, never with sudo):
+    ~/.config/armamentarium/elevate.json          LIVE grants only (v2, 0600, atomic writes)
+    ~/.local/state/armamentarium/grants.log       append-only ledger: one JSON line per grant
+                                                  that ENDED (revoked | revoke-all | expired |
+                                                  replaced), so elevate.json never has to keep
+                                                  history and `revoke all` no longer erases it.
+
+WHY a rule and not a command: an exec grant names a RULE defined in the operator-owned
+~/.config/armamentarium/exec.json (an argv pattern). A grant can only switch a rule on for a
+while; it can never authorise an argv that no rule describes.
+
+The router (armamentarium/mcp_router/config.py load_elevation) READS elevate.json, v1 or v2,
+and never writes it. This script is the only writer. Expired grants are moved to the ledger
+lazily, the next time this script runs (any verb, including `list`).
+
+Stdlib only, on purpose: it must run from /usr/local/bin without armamentarium's venv.
+Design + decisions: Substrate dom1/context/blocks/domain1-arma-exec.md ("Elevation v2").
+"""
+
+import errno
+import fcntl
+import json
+import os
+import re
+import socket
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime
+
+VERSION = 2
+TTL_CAP = 4 * 3600
+DEFAULT_TTL = {"path": 3600, "exec": 900}
+RULE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+HOST_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+TTL_RE = re.compile(r"^(\d+)([smhd]?)$")
+UNIT = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(HOME, ".config", "armamentarium")
+ELEVATE = os.path.join(CONFIG_DIR, "elevate.json")
+LOCK = os.path.join(CONFIG_DIR, ".elevate.lock")
+LEDGER = os.path.join(HOME, ".local", "state", "armamentarium", "grants.log")
+
+
+class UsageError(Exception):
+    pass
+
+
+def die(msg, code=1):
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def local_host():
+    return socket.gethostname().split(".")[0].lower()
+
+
+def fmt_time(t):
+    return datetime.fromtimestamp(t).strftime("%a %b %d %H:%M:%S")
+
+
+def fmt_left(secs):
+    secs = int(secs)
+    if secs <= 0:
+        return "expired"
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return (f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s")
+
+
+def parse_ttl(s):
+    """'900' / '15m' / '2h' -> seconds, or None if s isn't a ttl."""
+    m = TTL_RE.match(s.strip().lower())
+    if not m:
+        return None
+    return int(m.group(1)) * UNIT[m.group(2)]
+
+
+def clamp_ttl(secs):
+    if secs < 1:
+        raise UsageError("ttl must be at least 1 second")
+    if secs > TTL_CAP:
+        print(f"{PROG}: ttl {secs}s exceeds the {TTL_CAP // 3600}h cap; clamped to {TTL_CAP}s",
+              file=sys.stderr)
+        return TTL_CAP
+    return secs
+
+
+# --- storage ---------------------------------------------------------------------------
+
+@contextmanager
+def locked():
+    """Serialise writers. Two arma-elevate runs racing must not lose a grant."""
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def load():
+    """Return the live-grant list (v2 shape), translating a v1 file if found.
+
+    Refuses to proceed on a file it can't parse rather than overwriting it: a garbled
+    elevate.json is evidence of something, and the router already treats it as no grant.
+    """
+    if os.path.islink(ELEVATE):
+        die(f"{ELEVATE} is a symlink; refusing to follow it. Inspect and remove it by hand.")
+    try:
+        with open(ELEVATE) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        die(f"cannot parse {ELEVATE} ({exc}); not touching it. Inspect it, then delete it "
+            f"or move it aside.")
+    if isinstance(data, dict) and data.get("version") == VERSION:
+        grants = data.get("grants")
+        if not isinstance(grants, list):
+            die(f"{ELEVATE}: 'grants' is not a list; not touching it.")
+        return [g for g in grants if isinstance(g, dict)]
+    # v1: {"roots": [{"path","access"}], "expires_at": N}
+    exp = data.get("expires_at") if isinstance(data, dict) else None
+    out = []
+    if isinstance(exp, (int, float)):
+        me = local_host()
+        for r in data.get("roots", []) or []:
+            if isinstance(r, dict) and r.get("path"):
+                out.append({"kind": "path", "target": r["path"], "access": r.get("access", "rw"),
+                            "host": me, "granted_on": me, "granted_at": None,
+                            "expires_at": exp, "from_v1": True})
+    return out
+
+
+def save(grants):
+    """Atomic replace (temp + fsync + rename), 0600. No grants left -> no file."""
+    if not grants:
+        try:
+            os.unlink(ELEVATE)
+        except FileNotFoundError:
+            pass
+        return
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    tmp = f"{ELEVATE}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"version": VERSION,
+                       "_comment": "Written by arma-elevate. Live grants only; ended grants are in "
+                                   "~/.local/state/armamentarium/grants.log. Not a place for an "
+                                   "agent to write to itself.",
+                       "grants": grants}, fh, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, ELEVATE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def ledger(grant, reason, ended_at):
+    """Append one ended grant to the ledger. Append-only; never rewritten."""
+    os.makedirs(os.path.dirname(LEDGER), mode=0o700, exist_ok=True)
+    rec = dict(grant)
+    rec.update({"ended_at": ended_at, "end_reason": reason})
+    fd = os.open(LEDGER, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a") as fh:
+        fh.write(json.dumps(rec, sort_keys=True) + "\n")
+
+
+def prune(grants, now):
+    """Move expired grants to the ledger (ended_at = their own expiry). Returns live ones."""
+    live = []
+    for g in grants:
+        exp = g.get("expires_at")
+        if isinstance(exp, (int, float)) and now >= exp:
+            ledger(g, "expired", exp)
+        else:
+            live.append(g)
+    return live
+
+
+def same_grant(a, b):
+    return (a.get("kind") == b.get("kind")
+            and a.get("host") == b.get("host")
+            and a.get("target") == b.get("target")
+            and a.get("rule") == b.get("rule"))
+
+
+def describe(g, now=None):
+    now = time.time() if now is None else now
+    what = (f"path {g.get('target')} ({g.get('access')})" if g.get("kind") == "path"
+            else f"exec {g.get('rule')}")
+    host = g.get("host")
+    on = g.get("granted_on")
+    hosts = f"host={host}" + (f" granted_on={on}" if on and on != host else "")
+    exp = g.get("expires_at")
+    left = fmt_left(exp - now) if isinstance(exp, (int, float)) else "?"
+    return f"{what}  {hosts}  until {fmt_time(exp) if isinstance(exp, (int, float)) else '?'} ({left})"
+
+
+# --- verbs -------------------------------------------------------------------------------
+
+def add_grant(new):
+    now = time.time()
+    with locked():
+        grants = prune(load(), now)
+        kept = []
+        for g in grants:
+            if same_grant(g, new):
+                ledger(g, "replaced", now)
+            else:
+                kept.append(g)
+        kept.append(new)
+        save(kept)
+    print(f"Elevated: {describe(new, now)}")
+    print(f"Revoke early with: arma-revoke {new['kind']} "
+          f"{new.get('target') or new.get('rule')}"
+          + (f" {new['host']}" if new["kind"] == "exec" else ""))
+
+
+def cmd_path(args):
+    if not args:
+        raise UsageError("path needs a target: arma-elevate path <path> [r|rw] [ttl]")
+    target = os.path.abspath(os.path.expanduser(args[0]))
+    access, ttl = "rw", None
+    for a in args[1:]:
+        if a in ("r", "rw"):
+            access = a
+        elif parse_ttl(a) is not None:
+            ttl = parse_ttl(a)
+        else:
+            raise UsageError(f"unexpected argument {a!r} (want r|rw and/or a ttl)")
+    if not os.path.exists(target):
+        print(f"{PROG}: note: {target} does not exist (yet); granting anyway", file=sys.stderr)
+    now = time.time()
+    me = local_host()
+    secs = clamp_ttl(DEFAULT_TTL["path"] if ttl is None else ttl)
+    add_grant({"kind": "path", "target": target, "access": access, "host": me,
+               "granted_on": me, "granted_at": now, "expires_at": now + secs})
+
+
+def cmd_exec(args):
+    if not args:
+        raise UsageError("exec needs a rule: arma-elevate exec <rule> [host] [ttl]")
+    rule = args[0]
+    if not RULE_RE.match(rule):
+        raise UsageError(f"{rule!r} is not a rule name (rules are named in exec.json, "
+                         f"e.g. git-push); a grant cannot carry a raw command")
+    host, ttl = None, None
+    for a in args[1:]:
+        if parse_ttl(a) is not None and ttl is None:
+            ttl = parse_ttl(a)
+        elif host is None and HOST_RE.match(a.lower()):
+            host = a.lower()
+        else:
+            raise UsageError(f"unexpected argument {a!r} (want [host] [ttl])")
+    now = time.time()
+    me = local_host()
+    secs = clamp_ttl(DEFAULT_TTL["exec"] if ttl is None else ttl)
+    add_grant({"kind": "exec", "rule": rule, "host": host or me, "granted_on": me,
+               "granted_at": now, "expires_at": now + secs})
+
+
+def read_ledger(since):
+    out = []
+    try:
+        with open(LEDGER) as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec.get("ended_at"), (int, float)) and rec["ended_at"] >= since:
+                    out.append(rec)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def cmd_list(args):
+    show_expired = False
+    since_secs = 86400
+    it = iter(args)
+    for a in it:
+        if a == "expired":
+            show_expired = True
+        elif a == "--since":
+            v = next(it, None)
+            if v is None or parse_ttl(v) is None:
+                raise UsageError("--since takes a duration, e.g. --since 7d")
+            since_secs = parse_ttl(v)
+        else:
+            raise UsageError(f"unexpected argument {a!r} (want: list [expired] [--since T])")
+    now = time.time()
+    with locked():
+        live = prune(load(), now)
+        save(live)
+    if show_expired:
+        recs = read_ledger(now - since_secs)
+        if not recs:
+            print(f"No grants ended in the last {fmt_left(since_secs)}.")
+        for r in recs:
+            print(f"{fmt_time(r['ended_at'])}  {r['end_reason']:<10}  "
+                  + describe(r, r["ended_at"]).rsplit("  until", 1)[0])
+        return
+    if not live:
+        print("No active grants.")
+    for g in live:
+        print(describe(g, now))
+
+
+def cmd_revoke(args):
+    now = time.time()
+    with locked():
+        grants = prune(load(), now)
+        if not args:
+            if grants:
+                print("Active grants:", file=sys.stderr)
+                for g in grants:
+                    print("  " + describe(g, now), file=sys.stderr)
+            else:
+                print("No active grants.", file=sys.stderr)
+            save(grants)
+            raise UsageError("say what to revoke: all | path <path> | exec <rule> [host]")
+        verb, rest = args[0], args[1:]
+        if verb == "all":
+            for g in grants:
+                ledger(g, "revoke-all", now)
+            save([])
+            print(f"Revoked all ({len(grants)} grant(s)).")
+            return
+        if verb == "path" and len(rest) == 1:
+            probe = {"kind": "path", "target": os.path.abspath(os.path.expanduser(rest[0])),
+                     "host": local_host()}
+        elif verb == "exec" and len(rest) in (1, 2):
+            probe = {"kind": "exec", "rule": rest[0],
+                     "host": (rest[1].lower() if len(rest) == 2 else local_host())}
+        else:
+            raise UsageError("usage: arma-revoke all | path <path> | exec <rule> [host]")
+        kept, gone = [], []
+        for g in grants:
+            match = (g.get("kind") == probe["kind"] and g.get("host") == probe["host"]
+                     and (g.get("target") == probe.get("target") if probe["kind"] == "path"
+                          else g.get("rule") == probe.get("rule")))
+            (gone if match else kept).append(g)
+        for g in gone:
+            ledger(g, "revoked", now)
+        save(kept)
+    if not gone:
+        die("no matching active grant (nothing revoked)")
+    for g in gone:
+        print("Revoked: " + describe(g, now).rsplit("  until", 1)[0])
+
+
+def main(argv):
+    global PROG
+    PROG = os.path.basename(argv[0])
+    args = argv[1:]
+    if os.geteuid() == 0:
+        die("run this as yourself, not root/sudo: grants live in the invoking user's home, "
+            "so a root-run grant would never reach your router.")
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.split("\n\nFILES")[0])
+        return 0
+    # `arma-grant elevate|revoke ...` also works, for completeness.
+    if PROG == "arma-grant" and args and args[0] in ("elevate", "revoke"):
+        PROG = f"arma-{args[0]}"
+        args = args[1:]
+    try:
+        if PROG == "arma-revoke":
+            cmd_revoke(args)
+        elif not args:
+            raise UsageError("usage: arma-elevate path|exec|list ... (see --help)")
+        elif args[0] == "path":
+            cmd_path(args[1:])
+        elif args[0] == "exec":
+            cmd_exec(args[1:])
+        elif args[0] == "list":
+            cmd_list(args[1:])
+        else:
+            cmd_path(args)          # v1 form: arma-elevate <path> [r|rw] [ttl]
+    except UsageError as exc:
+        die(str(exc), 2)
+    return 0
+
+
+PROG = "arma-grant"
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

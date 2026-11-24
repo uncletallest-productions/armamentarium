@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,16 @@ DEFAULT_CONFIG_PATH = Path("~/.config/armamentarium/router.json").expanduser()
 ELEVATION_PATH = Path("~/.config/armamentarium/elevate.json").expanduser()
 
 VALID_ACCESS = ("r", "rw")
+
+
+def local_host() -> str:
+    """This machine's short hostname, lowercased.
+
+    Same normalisation as armamentarium's fleet.normalize_host() and the
+    arma-elevate script: grants are keyed on it, so all three must agree. A v2
+    grant whose ``host`` is not this host is ignored by this router.
+    """
+    return socket.gethostname().split(".")[0].lower()
 
 
 @dataclass(frozen=True)
@@ -126,33 +137,62 @@ def load_config(config_path: Optional[str] = None) -> RouterConfig:
 
 @dataclass
 class ElevationState:
-    """Result of checking the elevation sentinel: extra roots, and whether
-    they're currently active (present, well-formed, and unexpired)."""
+    """Result of checking the elevation sentinel.
+
+    ``roots`` are the ACTIVE path grants for this host. ``active`` is True when
+    there is at least one. ``expires_at`` is the latest expiry among active path
+    grants (or, when none are active, of the expired ones -- kept so the router
+    can say "a grant exists but has expired"). ``grants`` carries every active
+    grant of any kind as a plain dict, for status reporting; exec grants are
+    read here but only consumed once arma_exec exists.
+    """
 
     roots: List[Root] = field(default_factory=list)
     expires_at: Optional[float] = None  # epoch seconds
     active: bool = False
+    grants: List[dict] = field(default_factory=list)
+
+
+def _v1_grants(data: dict) -> List[dict]:
+    """Translate a v1 sentinel ({roots, expires_at}) into v2-shaped grants.
+
+    v1 had one expiry for the whole file and no host field (it was always this
+    host). Kept readable so an operator mid-upgrade, or an old arma-elevate still
+    on PATH somewhere, never silently loses a grant.
+    """
+    exp = data.get("expires_at")
+    if not isinstance(exp, (int, float)):
+        return []
+    out = []
+    for r in data.get("roots", []) or []:
+        if isinstance(r, dict) and "path" in r:
+            out.append({"kind": "path", "target": r["path"],
+                        "access": r.get("access", "r"), "host": local_host(),
+                        "expires_at": exp, "v1": True})
+    return out
 
 
 def load_elevation() -> ElevationState:
-    """Load a time-boxed elevation grant, if one is present and unexpired.
+    """Load time-boxed elevation grants, if any are present and unexpired.
 
     ``elevate.json`` is written by the OPERATOR, from their own local shell,
-    via the ``arma-elevate`` helper script (see ``bin/arma-elevate`` /
-    ``bin/arma-revoke``) — never by this router, the MCP server, or any agent
-    reachable through it. That's the point: an agent with only
+    via the ``arma-elevate`` helper script (``bin/arma-grant``; installed
+    root-owned to /usr/local/bin) — never by this router, the MCP server, or
+    any agent reachable through it. That's the point: an agent with only
     ``arma_read_file``/``arma_write_file`` cannot grant itself more roots by
     calling a tool; only a human touching the filesystem directly can.
 
-    Re-read fresh on every call (no in-process caching) so a manual revoke
-    (``rm ~/.config/armamentarium/elevate.json``) or a natural expiry takes
-    effect immediately, without restarting the long-lived router process.
+    Accepts both formats:
+      v1  {"roots": [{"path","access"}], "expires_at": N}
+      v2  {"version": 2, "grants": [{"kind": "path"|"exec", "target"|"rule",
+           "access", "host", "granted_on", "granted_at", "expires_at"}]}
 
-    Returns:
-        ElevationState. ``active`` is False (roots empty) if the file is
-        missing, malformed, or its ``expires_at`` has passed — expiry is
-        checked, not just presence, so a stale grant silently stops working
-        rather than needing to be remembered and revoked.
+    Re-read fresh on every call (no in-process caching) so a revoke or a natural
+    expiry takes effect immediately. This function NEVER writes the file:
+    pruning expired grants into the ledger is arma-elevate's job.
+
+    Fails closed per grant: a malformed entry is skipped, it never widens access.
+    Only grants whose ``host`` is this host count.
     """
     if not ELEVATION_PATH.exists():
         return ElevationState()
@@ -160,13 +200,46 @@ def load_elevation() -> ElevationState:
         data = json.loads(ELEVATION_PATH.read_text())
     except (json.JSONDecodeError, OSError):
         return ElevationState()
-    expires_at = data.get("expires_at")
-    if not isinstance(expires_at, (int, float)):
+    if not isinstance(data, dict):
         return ElevationState()
-    if time.time() >= expires_at:
-        return ElevationState(expires_at=expires_at, active=False)
-    try:
-        roots = [_resolve_root(entry) for entry in data.get("roots", [])]
-    except ValueError:
-        return ElevationState(expires_at=expires_at, active=False)
-    return ElevationState(roots=roots, expires_at=expires_at, active=True)
+
+    grants = data.get("grants") if data.get("version") == 2 else _v1_grants(data)
+    if not isinstance(grants, list):
+        return ElevationState()
+
+    now = time.time()
+    me = local_host()
+    roots: List[Root] = []
+    live: List[dict] = []
+    latest_active: Optional[float] = None
+    latest_any: Optional[float] = None
+    for g in grants:
+        if not isinstance(g, dict):
+            continue
+        exp = g.get("expires_at")
+        if not isinstance(exp, (int, float)):
+            continue
+        if str(g.get("host", "")).lower() != me:
+            continue
+        kind = g.get("kind")
+        if kind == "path":
+            latest_any = exp if latest_any is None else max(latest_any, exp)
+        if now >= exp:
+            continue
+        if kind == "path":
+            try:
+                roots.append(_resolve_root({"path": g.get("target", ""),
+                                            "access": g.get("access", "r")}))
+            except ValueError:
+                continue
+            latest_active = exp if latest_active is None else max(latest_active, exp)
+            live.append(g)
+        elif kind == "exec" and isinstance(g.get("rule"), str):
+            live.append(g)
+
+    return ElevationState(
+        roots=roots,
+        expires_at=latest_active if roots else latest_any,
+        active=bool(roots),
+        grants=live,
+    )
