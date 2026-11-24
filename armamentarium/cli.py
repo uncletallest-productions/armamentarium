@@ -354,11 +354,21 @@ def cmd_config(args: argparse.Namespace) -> int:
             config_sync.untrack(args.path, host=args.host)
             print(f"untracked: {args.path}")
         elif args.config_cmd == "adopt":
-            result = config_sync.adopt(host=args.host)
+            result = config_sync.adopt(host=args.host, apply=args.apply)
             print(json.dumps(result, indent=2))
-            if result["new"]:
-                print(f"\nadded {len(result['new'])} path(s) to tracked.txt — run "
+            if result["new"] and result["applied"]:
+                print(f"\nadded {len(result['new'])} path(s) to "
+                      f"{config_sync.local_tracked_path()} — run "
                       "`armamentarium config capture` to actually mirror them.")
+            elif result["new"]:
+                print(f"\n(dry run) {len(result['new'])} path(s) WOULD be added to "
+                      f"{config_sync.local_tracked_path()}. Read the names above; re-run "
+                      "with --apply to add them.")
+            if result["refused"]:
+                print(f"\n{len(result['refused'])} mirrored file(s) refused (secret-looking or "
+                      "unsafe path), never proposed:")
+                for r in result["refused"]:
+                    print(f"  {r['path']}: {r['reason']}")
             if result["no_live_source"]:
                 print(f"\n{len(result['no_live_source'])} mirrored file(s) have no live "
                       "counterpart under ~/.config — left untouched, not adopted:")
@@ -559,8 +569,10 @@ def build_parser() -> argparse.ArgumentParser:
     cfgu.add_argument("--host", help="override hostname (default: this machine)")
     cfgu.set_defaults(func=cmd_config)
 
-    cfga = cfgsub.add_parser("adopt", help="add pre-existing mirrored files (with a live ~/.config counterpart) to tracked.txt")
+    cfga = cfgsub.add_parser("adopt", help="propose pre-existing mirrored files (with a live ~/.config counterpart) for the local tracked list (dry-run by default)")
     cfga.add_argument("--host", help="override hostname (default: this machine)")
+    cfga.add_argument("--apply", action="store_true",
+                      help="append the proposed paths to ~/.config/armamentarium/tracked.txt")
     cfga.set_defaults(func=cmd_config)
 
     pk = sub.add_parser("packages", help="below-decks package-state (apt/Flatpak/Snap/AppImage) — see packages.py")

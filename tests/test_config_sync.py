@@ -78,8 +78,16 @@ class Base(unittest.TestCase):
         self.save()
 
     def save(self):
-        (self.hdir / "tracked.txt").write_text("\n".join(self.tracked) + "\n")
+        self.write_local("\n".join(self.tracked) + "\n")
+        (self.hdir / "tracked.txt").write_text("\n".join(self.tracked) + "\n")  # store copy
         (self.hdir / "manifest.json").write_text(json.dumps(self.manifest))
+
+    def write_local(self, text, mode=0o644):
+        p = self.cfg / "armamentarium" / "tracked.txt"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+        os.chmod(p, mode)
+        return p
 
     def plan(self, force=False):
         return plan_deploy(HOST, self.root, self.home, force=force)
@@ -263,8 +271,7 @@ class TestCapture(Base):
         (self.cfg / "armamentarium").mkdir()
         (self.cfg / "armamentarium/elevate.json").write_bytes(b"{}\n")
         (self.cfg / "ok.conf").write_bytes(b"fine\n")
-        (self.hdir / "tracked.txt").write_text(
-            "../.ssh/id_ed25519\narmamentarium/elevate.json\nok.conf\n")
+        self.write_local("../.ssh/id_ed25519\narmamentarium/elevate.json\nok.conf\n")
         r = cs.capture(HOST, self.root, self.home)
         self.assertEqual(r["synced"], ["ok.conf"])
         self.assertEqual({x["path"] for x in r["refused_unsafe"]},
@@ -274,7 +281,7 @@ class TestCapture(Base):
     def test_capture_refuses_symlink_out_of_config(self):
         (self.home / "secret").write_bytes(b"private\n")
         os.symlink(self.home / "secret", self.cfg / "link.conf")
-        (self.hdir / "tracked.txt").write_text("link.conf\n")
+        self.write_local("link.conf\n")
         r = cs.capture(HOST, self.root, self.home)
         self.assertEqual(r["synced"], [])
         self.assertFalse((self.mirror / "link.conf").exists())
@@ -294,11 +301,110 @@ class TestCapture(Base):
             git("commit", "-qm", "base")
             other.write_text("x\nUNRELATED EDIT\n")          # dirty, not ours
             (self.cfg / "ok.conf").write_bytes(b"fine\n")
-            (self.hdir / "tracked.txt").write_text("ok.conf\n")
+            self.write_local("ok.conf\n")
             cs.capture(HOST, self.root, self.home)
             self.assertIn("otherhost/tracked.txt", git("status", "--porcelain"))
             self.assertIn(f"config/{HOST}/", git("show", "--name-only", "--format=", "HEAD"))
             self.assertNotIn("otherhost", git("show", "--name-only", "--format=", "HEAD"))
+
+
+class TestLocalTrackedIsAuthoritative(Base):
+    def test_missing_local_list_fails_closed_with_install_hint(self):
+        (self.hdir / "tracked.txt").write_text("ok.conf\n")       # store copy only
+        with self.assertRaises(ConfigSyncError) as cm:
+            self.plan()
+        self.assertIn("install -D -m 0644", str(cm.exception))
+        with self.assertRaises(ConfigSyncError):
+            cs.capture(HOST, self.root, self.home)
+
+    def test_group_writable_or_symlinked_local_list_refused(self):
+        p = self.write_local("ok.conf\n", mode=0o664)
+        with self.assertRaises(ConfigSyncError):
+            self.plan()
+        p.unlink()
+        real = self.home / "elsewhere.txt"
+        real.write_text("ok.conf\n")
+        os.symlink(real, p)
+        with self.assertRaises(ConfigSyncError):
+            self.plan()
+
+    def test_store_only_line_is_ignored_by_deploy(self):
+        self.put("foo/app.conf", live=b"a=1\n", store=b"a=1\n")
+        # attacker adds a line + mirror + manifest entry to the STORE only
+        (self.mirror / "foo").mkdir(exist_ok=True)
+        (self.mirror / "foo/sneaky.conf").write_bytes(b"evil\n")
+        self.manifest["files"]["foo/sneaky.conf"] = {"updated": "x", "size": 0,
+                                                     "sha256": sha(b"evil\n")}
+        (self.hdir / "manifest.json").write_text(json.dumps(self.manifest))
+        (self.hdir / "tracked.txt").write_text("foo/app.conf\nfoo/sneaky.conf\n")
+        e = self.entry(self.plan(), "foo/sneaky.conf")
+        self.assertEqual(e.action, "refused")
+        self.assertIn("armamentarium/tracked.txt", e.reason)
+
+    def test_capture_regenerates_store_copy_and_ignores_its_edits(self):
+        (self.cfg / "ok.conf").write_bytes(b"fine\n")
+        self.write_local("ok.conf\n")
+        (self.hdir / "tracked.txt").write_text("ok.conf\ngh/hosts.yml\n")   # store edit
+        r = cs.capture(HOST, self.root, self.home)
+        self.assertEqual(r["synced"], ["ok.conf"])
+        copy = (self.hdir / "tracked.txt").read_text()
+        self.assertTrue(copy.startswith("# GENERATED"))
+        self.assertNotIn("gh/hosts.yml", copy)
+
+
+class TestSecretDenyList(Base):
+    def test_capture_skips_secret_looking_paths(self):
+        for rel in ("gh/hosts.yml", "Claude/Cookies", "foo/api_token.json", "bar/id_ed25519",
+                    "Claude/claude_desktop_config.json", "ok.conf"):
+            f = self.cfg / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(b"x\n")
+        self.write_local("gh/hosts.yml\nClaude/Cookies\nfoo/api_token.json\nbar/id_ed25519\n"
+                         "Claude/claude_desktop_config.json\nok.conf\n")
+        r = cs.capture(HOST, self.root, self.home)
+        self.assertEqual(sorted(r["synced"]), ["Claude/claude_desktop_config.json", "ok.conf"])
+        self.assertEqual(len(r["refused_unsafe"]), 4)
+
+    def test_real_fleet_lists_are_not_flagged(self):
+        # hecate + sisyphus tracked lists as of 2026-11-24: none may trip the deny list
+        for rel in ("labwc/rc.xml", "labwc/menu.xml", "labwc/autostart", "kanshi/config",
+                    "systemd/user/graphical-session.target.wants/kanshi.service",
+                    "systemd/user/default.target.wants/yubikey-agent.service",
+                    "systemd/user/kanshi.service", "Claude/claude_desktop_config.json",
+                    "armamentarium/desktop.json", "armamentarium/dock.json",
+                    "armamentarium/exec.json", "armamentarium/router.json",
+                    "stoa/fleet-hosts.json", "stoa/reliquary-mounts.json"):
+            self.assertIsNone(cs.secret_reason(rel), rel)
+
+
+class TestAdopt(Base):
+    def setUp(self):
+        super().setUp()
+        self.write_local("ok.conf\n")
+        for rel in ("new.conf", "gh/hosts.yml"):
+            for base in (self.cfg, self.mirror):
+                f = base / rel
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(b"x\n")
+
+    def test_dry_run_by_default_and_secrets_never_proposed(self):
+        r = cs.adopt(HOST, self.root, self.home)
+        self.assertEqual(r["new"], ["new.conf"])
+        self.assertEqual([x["path"] for x in r["refused"]], ["gh/hosts.yml"])
+        self.assertFalse(r["applied"])
+        self.assertEqual((self.cfg / "armamentarium/tracked.txt").read_text(), "ok.conf\n")
+
+    def test_apply_appends_to_local_list_only(self):
+        store_before = (self.hdir / "tracked.txt").read_text() if (
+            self.hdir / "tracked.txt").exists() else None
+        r = cs.adopt(HOST, self.root, self.home, apply=True)
+        self.assertTrue(r["applied"])
+        local = (self.cfg / "armamentarium/tracked.txt").read_text()
+        self.assertIn("new.conf", local)
+        self.assertNotIn("gh/hosts.yml", local)
+        after = (self.hdir / "tracked.txt").read_text() if (
+            self.hdir / "tracked.txt").exists() else None
+        self.assertEqual(after, store_before)
 
 
 if __name__ == "__main__":
