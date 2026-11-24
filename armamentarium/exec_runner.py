@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from . import exec_policy
+from . import exec_policy, session_env
 from .mcp_router.config import load_elevation, local_host
 
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -41,8 +41,10 @@ EXEC_LOG = Path("~/.local/state/armamentarium/exec.log").expanduser()
 # empty, agent commits simply run no hooks -- never the repo's own (agent-reachable) hooks.
 APPROVED_HOOKS = "/usr/local/share/armamentarium/git-hooks"
 
-PASS_ENV = ("HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR",
-            "DBUS_SESSION_BUS_ADDRESS")
+# XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS are NOT passed through blindly: session_env
+# verifies an inherited value or derives one from the uid (the server is usually launched
+# without them, which broke every `systemctl --user` rule -- smoke test #8, 2026-11-24).
+PASS_ENV = ("HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK")
 GIT_HARDEN = [
     "-c", "core.fsmonitor=false",              # status/diff would run it
     "-c", f"core.hooksPath={APPROVED_HOOKS}",  # never the repo's own hooks
@@ -94,6 +96,7 @@ def harden(argv: List[str]) -> List[str]:
 
 def _env() -> dict:
     env = {k: os.environ[k] for k in PASS_ENV if k in os.environ}
+    env.update(session_env.session_env())
     env.update({"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TERM": "dumb",
                 "GIT_TERMINAL_PROMPT": "0", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"})
     return env
