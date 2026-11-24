@@ -12,13 +12,16 @@ license = { text = "MIT" }
 authors = [{ name = "Uncle Tallest Productions" }]
 keywords = ["mcp", "claude", "filesystem", "session-roaming", "fastmcp"]
 dependencies = [
-    "mcp>=1.2.0",
+    # <2: mcp 2.x renamed FastMCP (mcp.server.fastmcp -> mcp.server.mcpserver.MCPServer) and
+    # changed other APIs; the router is written against 1.x. Lift only after porting.
+    "mcp>=1.2.0,<2",
     "pydantic>=2.0",
 ]
 
 [project.scripts]
 armamentarium-fs = "armamentarium.mcp_router.server:main"
 armamentarium = "armamentarium.cli:main"
+arma = "armamentarium.cli:main"   # short alias: same CLI, easier to type
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
