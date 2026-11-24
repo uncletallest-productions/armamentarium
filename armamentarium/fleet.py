@@ -73,7 +73,7 @@ def normalize_host(name: str) -> str:
                         the display spelling belongs in display_name, which this
                         registry already carries for exactly that purpose.
       split(".")[0]  -- gethostname() returns the FQDN on a host configured that way,
-                        which would fork a THIRD key (`hecate.example-tailnet.ts.net`)
+                        which would fork a THIRD key (`myhost.example-tailnet.ts.net`)
                         the first time someone changed a resolver setting.
 
     Same class as reliquary-mode's VIATICUS_POOL needing `tr '[:upper:]' '[:lower:]'`:

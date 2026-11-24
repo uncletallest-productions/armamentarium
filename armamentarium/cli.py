@@ -5,11 +5,11 @@ Dry-run by default: prints a plan and writes nothing. Add --apply to execute.
 
 Examples:
     # preview docking an archived session onto this machine
-    armamentarium dock ~/Datasets/Substrate/dom0/sisyphus-archive/sessions/local_<uuid>
+    armamentarium dock /mnt/share/claude-sessions/archive/local_<uuid>
 
     # actually do it, with an explicit extra path mapping
     armamentarium dock <session-dir> --apply \\
-        --path-map /home/youruser/Scriptorium=/home/youruser/Datasets/Scriptorum
+        --path-map /home/youruser/old-projects=/home/youruser/projects
 """
 
 from __future__ import annotations

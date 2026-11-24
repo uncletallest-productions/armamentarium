@@ -1,11 +1,11 @@
 {
-  "_comment": "Copy to ~/.config/armamentarium/dock.json. 'path_map' rewrites stale mount roots in a session's userSelectedFolders (and cwd) when docking it onto this machine (keys matched longest-first). 'source_dirs' are directories `armamentarium list` and the Oraculum hub picker scan for dockable sessions.",
+  "_comment": "Copy to ~/.config/armamentarium/dock.json. 'path_map' rewrites stale mount roots in a session's userSelectedFolders (and cwd) when docking it onto this machine (keys matched longest-first). 'source_dirs' are directories `armamentarium list` scans for dockable sessions. 'roaming_store' is the shared directory holding the checkout ledger and undocked sessions.",
   "path_map": {
-    "/home/youruser/Substrate": "/home/youruser/Datasets/Substrate",
-    "/home/youruser/Scriptorium": "/home/youruser/Datasets/Scriptorum"
+    "/home/youruser/old-projects": "/home/youruser/projects",
+    "/mnt/oldshare": "/mnt/share"
   },
   "source_dirs": [
-    "~/Datasets/Substrate/dom0/sisyphus-archive/sessions"
+    "/mnt/share/claude-sessions/archive"
   ],
-  "roaming_store": "~/Datasets/Substrate/dom0/session-roaming"
+  "roaming_store": "/mnt/share/claude-sessions/roaming"
 }
