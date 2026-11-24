@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "_notes": [
+    "Example exec policy for arma_exec. Install: cp to ~/.config/armamentarium/exec.json, chmod 0644.",
+    "Keep it OUTSIDE every root an agent can write (the router refuses a policy that is group/world-writable or not yours).",
+    "Anything not matched by a rule is refused. Options not listed in a rule's 'options' are refused. argv never touches a shell.",
+    "mode: 'always' runs without approval; 'elevated' needs a live grant: arma-elevate exec <rule> [host] [ttl].",
+    "Placeholders: {int} {name} {word} {unit} {host} {time} {text} {ref} {dataset}; '?' suffix = optional; {path:ROOT} must resolve under a named root.",
+    "Edit roots to match your machine. This example assumes code in ~/projects/<owner>/<repo>."
+  ],
+  "roots": {
+    "repos-read": [
+      "~/projects/*"
+    ],
+    "repos-write": [
+      "~/projects/*/*"
+    ],
+    "mounts": [
+      "/mnt/*",
+      "/home"
+    ]
+  },
+  "rules": {
+    "git-status": {
+      "mode": "always",
+      "description": "Working-tree status of any repo under ~/projects",
+      "argv": ["git", "-C", "{path:repos-read}", "status"],
+      "options": {"-s": null, "-b": null, "--porcelain": null, "--short": null, "--branch": null}
+    },
+    "git-log": {
+      "mode": "always",
+      "description": "Commit history",
+      "argv": ["git", "-C", "{path:repos-read}", "log"],
+      "options": {"--oneline": null, "-n": "{int}", "--stat": null, "--graph": null,
+                  "--decorate": null, "--since": "{time}", "--name-only": null},
+      "args": ["{ref?}"]
+    },
+    "git-diff": {
+      "mode": "always",
+      "description": "Changes, summary forms only (patch text could run textconv)",
+      "argv": ["git", "-C", "{path:repos-read}", "diff"],
+      "options": {"--stat": null, "--cached": null, "--name-only": null, "--name-status": null},
+      "args": ["{ref?}", "{ref?}"]
+    },
+    "git-show": {
+      "mode": "always",
+      "description": "One commit, summary forms",
+      "argv": ["git", "-C", "{path:repos-read}", "show"],
+      "options": {"--stat": null, "--name-only": null, "--name-status": null, "--summary": null},
+      "args": ["{ref?}"]
+    },
+    "git-add": {
+      "mode": "always",
+      "argv": ["git", "-C", "{path:repos-write}", "add"],
+      "args": ["{path:repos-write}"]
+    },
+    "git-commit": {
+      "mode": "always",
+      "argv": ["git", "-C", "{path:repos-write}", "commit"],
+      "options": {"-m": "{text}"}
+    },
+    "git-push": {
+      "mode": "elevated",
+      "description": "Never --force. Needs a grant, so the operator always knows a push happened",
+      "argv": ["git", "-C", "{path:repos-write}", "push"],
+      "options": {"-u": null},
+      "args": ["{word?}", "{name?}"],
+      "timeout": 60
+    },
+    "unit-status": {
+      "mode": "always",
+      "argv": ["systemctl", "status|is-active|is-failed|is-enabled"],
+      "options": {"--no-pager": null, "-n": "{int}"},
+      "args": ["{unit}"]
+    },
+    "user-unit-status": {
+      "mode": "always",
+      "argv": ["systemctl", "--user", "status|is-active|is-failed|is-enabled"],
+      "options": {"--no-pager": null, "-n": "{int}"},
+      "args": ["{unit}"]
+    },
+    "journal": {
+      "mode": "always",
+      "timeout": 20,
+      "description": "Read the journal (join the systemd-journal group to see system messages without sudo)",
+      "argv": ["journalctl", "--no-pager"],
+      "options": {"-b": "{int?}", "-n": "{int}", "-u": "{unit}", "-p": "{word}",
+                  "--since": "{time}", "--until": "{time}", "-r": null}
+    },
+    "unit-restart": {
+      "mode": "elevated",
+      "sudo": true,
+      "description": "Needs a grant AND an exact NOPASSWD sudoers line for this command",
+      "argv": ["systemctl", "restart"],
+      "args": ["{unit}"]
+    },
+    "uptime": {"mode": "always", "argv": ["uptime"]},
+    "free": {"mode": "always", "argv": ["free", "-h"]},
+    "df": {"mode": "always", "argv": ["df", "-h"], "options": {"-T": null}},
+    "findmnt": {"mode": "always", "argv": ["findmnt"], "options": {"-T": "{path:mounts}"}},
+    "ip-show": {"mode": "always", "argv": ["ip", "-br", "addr|link"]},
+    "ping": {
+      "mode": "always",
+      "argv": ["ping", "-c", "{int}"],
+      "options": {"-W": "{int}"},
+      "args": ["{host}"]
+    }
+  }
+}
