@@ -170,6 +170,18 @@ class PathTests(Base):
         d = self.no(["git", "-C", str(self.root / "repos" / "escape"), "status"])
         self.assertIn("resolves to", d.reason)
 
+    def test_run_argv_uses_checked_path(self):
+        d = self.ok(["git", "-C", self.repo + "/sub/..", "status", "-s"])
+        self.assertEqual(d.run_argv, ["git", "-C", self.repo, "status", "-s"])
+
+    def test_tilde_expanded_for_running(self):
+        home = os.path.expanduser("~")
+        pol = self.make({"version": 1, "roots": {"h": [home]},
+                         "rules": {"ls": {"mode": "always", "argv": ["ls"], "args": ["{path:h}"]}}})
+        d = decide(["ls", "~"], HOST, pol, [])
+        self.assertTrue(d.allowed, d.message())
+        self.assertEqual(d.run_argv, ["ls", os.path.realpath(home)])
+
     def test_relative_refused(self):
         self.no(["git", "-C", "repos/armamentarium", "status"], contains="absolute")
 

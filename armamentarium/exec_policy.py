@@ -266,47 +266,59 @@ def _under(path: str, root: Root) -> bool:
 
 def _value_ok(spec: str, tok: str, policy: Policy) -> Tuple[bool, str]:
     """Does ``tok`` satisfy ``spec``? Returns (ok, reason-if-not)."""
+    ok, why, _ = _check_value(spec, tok, policy)
+    return ok, why
+
+
+def _check_value(spec: str, tok: str, policy: Policy) -> Tuple[bool, str, str]:
+    """(ok, reason-if-not, token-to-run). For {path:ROOT} the token to run is the path exactly
+    as it was checked (``~`` expanded, resolved) -- there is no shell to expand ``~`` later, and
+    running the checked form means what runs is what was approved."""
     if not spec.startswith("{"):
         choices = spec.split("|")
         if tok in choices:
-            return True, ""
+            return True, "", tok
         return False, (f"expected {' or '.join(repr(c) for c in choices)}"
-                       if len(choices) > 1 else f"expected {spec!r}")
+                       if len(choices) > 1 else f"expected {spec!r}"), tok
     m = PLACEHOLDER.match(spec)
     if m.group(1):
         if TYPES[m.group(1)].match(tok):
-            return True, ""
-        return False, f"{tok!r} is not a valid {m.group(1)}"
+            return True, "", tok
+        return False, f"{tok!r} is not a valid {m.group(1)}", tok
     root = policy.roots[m.group(3)]
     if not tok or "\x00" in tok:
-        return False, "empty or NUL path"
+        return False, "empty or NUL path", tok
     expanded = os.path.expanduser(tok)
     if not os.path.isabs(expanded):
-        return False, f"path {tok!r} must be absolute (or ~/...)"
+        return False, f"path {tok!r} must be absolute (or ~/...)", tok
     resolved = os.path.realpath(expanded) if root.resolve else os.path.normpath(expanded)
     if _under(resolved, root):
-        return True, ""
+        return True, "", resolved
     shown = f"{tok!r}" + (f" (resolves to {resolved!r})" if resolved != expanded else "")
-    return False, f"path {shown} is not under root {root.name!r} ({', '.join(root.patterns)})"
+    return False, f"path {shown} is not under root {root.name!r} ({', '.join(root.patterns)})", tok
 
 
 def _optional_type(spec: Optional[str]) -> bool:
     return bool(spec and spec.endswith("?}"))
 
 
-def match_rule(rule: Rule, argv: List[str], policy: Policy) -> None:
-    """Raise NoMatch if ``argv`` does not satisfy ``rule``; return None if it does."""
+def match_rule(rule: Rule, argv: List[str], policy: Policy) -> List[str]:
+    """Raise NoMatch if ``argv`` does not satisfy ``rule``. If it does, return the argv to RUN:
+    identical to ``argv`` except each {path:ROOT} token is replaced by the exact path that was
+    checked (``~`` expanded, symlinks resolved)."""
     if len(argv) < len(rule.argv):
-        # report against the first missing token, depth = what did match
+        # report against the first mismatching token, depth = what did match
         for i, spec in enumerate(rule.argv[:len(argv)]):
             ok, why = _value_ok(spec.replace("?}", "}"), argv[i], policy)
             if not ok:
                 raise NoMatch(i, f"token {i} {argv[i]!r}: {why}")
         raise NoMatch(len(argv), f"incomplete: rule needs {' '.join(rule.argv)}")
+    out: List[str] = []
     for i, spec in enumerate(rule.argv):
-        ok, why = _value_ok(spec, argv[i], policy)
+        ok, why, run_tok = _check_value(spec, argv[i], policy)
         if not ok:
             raise NoMatch(i, f"token {i} {argv[i]!r}: {why}")
+        out.append(run_tok)
 
     i = len(rule.argv)
     pos = 0
@@ -326,39 +338,48 @@ def match_rule(rule: Rule, argv: List[str], policy: Policy) -> None:
             if vspec is None:
                 if eq:
                     raise NoMatch(i, f"option {opt!r} takes no value")
+                out.append(tok)
                 i += 1
                 continue
             if eq:
-                ok, why = _value_ok(vspec.replace("?}", "}"), attached, policy)
+                ok, why, run_v = _check_value(vspec.replace("?}", "}"), attached, policy)
                 if not ok:
                     raise NoMatch(i, f"value for {opt}: {why}")
+                out.append(f"{opt}={run_v}")
                 i += 1
                 continue
             nxt = argv[i + 1] if i + 1 < len(argv) else None
             if _optional_type(vspec):
-                if nxt is not None and _value_ok(vspec.replace("?}", "}"), nxt, policy)[0]:
-                    i += 2
-                else:
-                    i += 1
+                if nxt is not None:
+                    ok, _, run_v = _check_value(vspec.replace("?}", "}"), nxt, policy)
+                    if ok:
+                        out += [opt, run_v]
+                        i += 2
+                        continue
+                out.append(opt)
+                i += 1
                 continue
             if nxt is None:
                 raise NoMatch(i, f"option {opt!r} needs a value ({vspec})")
-            ok, why = _value_ok(vspec, nxt, policy)
+            ok, why, run_v = _check_value(vspec, nxt, policy)
             if not ok:
                 raise NoMatch(i + 1, f"value for {opt}: {why}")
+            out += [opt, run_v]
             i += 2
             continue
         if pos >= len(rule.args):
             raise NoMatch(i, f"unexpected argument {tok!r} (rule {rule.name!r} takes "
                              f"{len(rule.args)} positional argument(s))")
-        ok, why = _value_ok(rule.args[pos], tok, policy)
+        ok, why, run_tok = _check_value(rule.args[pos], tok, policy)
         if not ok:
             raise NoMatch(i, f"argument {pos + 1}: {why}")
+        out.append(run_tok)
         pos += 1
         i += 1
     missing = [a for a in rule.args[pos:] if not _optional_type(a)]
     if missing:
         raise NoMatch(i, f"missing argument(s): {' '.join(missing)}")
+    return out
 
 
 # --- grants + the decision ---------------------------------------------------------------------
@@ -374,6 +395,7 @@ class Decision:
     max_output: int = 256 * 1024
     grant: Optional[dict] = None
     hint: str = ""            # exact operator command that would make this allowed, if any
+    run_argv: Optional[List[str]] = None   # what to execute: checked paths substituted in
 
     def message(self) -> str:
         return self.reason + (f"\n  To allow: {self.hint}" if self.hint else "")
@@ -404,13 +426,14 @@ def decide(argv: List[str], host: str, policy: Policy, grants: List[dict],
         return Decision(False, "refused: NUL byte in argv")
 
     matched: List[Rule] = []
+    run_for: Dict[str, List[str]] = {}
     nearest: Optional[Tuple[int, Rule, str]] = None
     wrong_host: List[Rule] = []
     for rule in policy.rules.values():
         if rule.argv[0] != argv[0]:
             continue
         try:
-            match_rule(rule, argv, policy)
+            run_for[rule.name] = match_rule(rule, argv, policy)
         except NoMatch as nm:
             if nearest is None or nm.depth > nearest[0]:
                 nearest = (nm.depth, rule, nm.why)
@@ -434,13 +457,14 @@ def decide(argv: List[str], host: str, policy: Policy, grants: List[dict],
         if rule.mode == "always":
             return Decision(True, f"allowed by {rule.name!r} (always)", rule=rule.name,
                             mode="always", sudo=rule.sudo, timeout=rule.timeout,
-                            max_output=rule.max_output)
+                            max_output=rule.max_output, run_argv=run_for[rule.name])
         g = _active_exec_grant(rule.name, host, grants, now)
         if g:
             left = int(g["expires_at"] - now)
             return Decision(True, f"allowed by {rule.name!r} (elevated; grant has {left}s left)",
                             rule=rule.name, mode="elevated", sudo=rule.sudo,
-                            timeout=rule.timeout, max_output=rule.max_output, grant=g)
+                            timeout=rule.timeout, max_output=rule.max_output, grant=g,
+                            run_argv=run_for[rule.name])
     r = matched[0]
     host_arg = "" if host == _this_host() else f" {host}"
     return Decision(False, f"refused: `{shown}` needs rule {r.name!r}, which requires the "

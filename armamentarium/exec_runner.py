@@ -143,7 +143,7 @@ def execute(argv: List[str], host: Optional[str] = None,
     if not prog:
         return refuse(f"refused: {argv[0]!r} is allowed by {d.rule!r} but is not installed "
                       f"on {host} (searched {SAFE_PATH})", d.rule)
-    run = harden(argv)
+    run = harden(d.run_argv or argv)   # checked paths, not the caller's spelling
     run[0] = prog
     if d.sudo:
         sudo = shutil.which("sudo", path=SAFE_PATH)

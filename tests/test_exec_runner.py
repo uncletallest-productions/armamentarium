@@ -106,7 +106,7 @@ class RunnerTests(RunnerBase):
         self.assertIn("not built yet", r.reason)
 
     def test_missing_policy_fails_closed(self):
-        r = execute(["true"], policy_path=self.t / "none.json", grants=[])
+        r = execute(["true"], policy_path=self.t / "none.json", grants=[])  # missing file
         self.assertFalse(r.allowed)
         self.assertIn("nothing may run", r.reason)
 
@@ -138,6 +138,21 @@ class RunnerTests(RunnerBase):
         r = self.run_(["head", "-c", "5000", "/dev/zero"])
         self.assertTrue(r.truncated)
         self.assertEqual(len(r.stdout), 100)
+
+    def test_runs_checked_path_not_typed_one(self):
+        self.git("init", "-q")
+        r = self.run_(["git", "-C", str(self.repo) + "/.", "status", "-s"])
+        self.assertEqual(r.exit_code, 0, r.stderr)
+        self.assertIn(str(self.repo), r.ran)
+        self.assertNotIn(str(self.repo) + "/.", r.ran)
+
+    def test_tilde_path_runs(self):
+        link = self.home / "r"
+        os.symlink(self.repo, link)   # ~/r -> repo, inside the git root once resolved
+        self.git("init", "-q")
+        r = self.run_(["git", "-C", "~/r", "status", "-s"])
+        self.assertEqual(r.exit_code, 0, r.stderr)
+        self.assertIn(str(self.repo), r.ran)
 
     def test_long_args_clipped_in_log(self):
         self.git("init", "-q")
