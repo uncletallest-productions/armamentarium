@@ -40,7 +40,9 @@ Matching, in order:
          ANY option not listed is refused. That is the whole safety model for flags: there is
          no blacklist to forget to update (``git log --output``, ``git -c core.sshCommand=``,
          ``smartctl -t``, ``journalctl --vacuum-size`` all fail by construction).
-       * positionals fill ``args`` in order; extra positionals are refused.
+       * positionals fill ``args`` in order; extra positionals are refused -- unless the last
+         slot ends in ``...`` (``{file:ROOT...}``), which takes ONE OR MORE values, each
+         checked on its own.
      Combined short flags (``-sb``) are NOT expanded: list them literally if wanted.
   3. ``--`` is refused (it would let a later token that looks like an option slip past as a
      positional).
@@ -55,6 +57,14 @@ metacharacters -- though argv is never handed to a shell anyway):
   path:ROOT  realpath'd (unless the root says resolve:false), then must equal or sit under a
              path matching one of the root's glob patterns. Symlink escapes resolve OUT of the
              root and fail; ``..`` is normalised away before the check either way.
+  file:ROOT  as path:ROOT, but never a directory (a repo root is ``git add .`` by another
+             name). A path that does not exist is allowed, so a deletion can be staged.
+  A trailing ``...`` (``{path:ROOT...}`` / ``{file:ROOT...}``) repeats the slot; only the last
+  positional may have it.
+
+Top-level ``git_identity`` (optional): ``{"name": ..., "email": ...}``, the author/committer the
+runner stamps on every agent git command (default: exec_runner.DEFAULT_GIT_IDENTITY). Agent
+commits are then labelled as such in every repo, whatever that repo's user.name says.
 
 Per-rule fields: mode always|elevated (default elevated -- safe default), sudo (bool),
 hosts (["*"] default), timeout (s, default 30), max_output (bytes, default 262144),
@@ -92,7 +102,8 @@ TYPES = {
     # parsed as an option first).
     "text": re.compile(r"^[^\x00-\x08\x0b-\x1f\x7f]{1,4096}$"),
 }
-PLACEHOLDER = re.compile(r"^\{(int|name|word|unit|host|time|text|ref|dataset)(\?)?\}$|^\{path:([A-Za-z0-9_-]+)\}$")
+PLACEHOLDER = re.compile(r"^\{(int|name|word|unit|host|time|text|ref|dataset)(\?)?\}$"
+                         r"|^\{(path|file):([A-Za-z0-9_-]+)(\.\.\.)?\}$")
 RULE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RULE_KEYS = {"mode", "argv", "options", "args", "sudo", "hosts", "timeout", "max_output",
              "description"}
@@ -135,9 +146,10 @@ class Policy:
     roots: Dict[str, Root]
     rules: Dict[str, Rule]
     source: str = ""
+    git_identity: Optional[Dict[str, str]] = None   # {"name", "email"}; None = runner default
 
 
-def _check_spec(spec: str, roots: Dict[str, dict], where: str) -> None:
+def _check_spec(spec: str, roots: Dict[str, dict], where: str, variadic_ok: bool = False) -> None:
     """A token spec is a literal, an a|b alternation, or a known placeholder."""
     if not isinstance(spec, str) or not spec:
         raise PolicyError(f"{where}: empty or non-string token spec {spec!r}")
@@ -145,8 +157,11 @@ def _check_spec(spec: str, roots: Dict[str, dict], where: str) -> None:
         m = PLACEHOLDER.match(spec)
         if not m:
             raise PolicyError(f"{where}: unknown placeholder {spec!r}")
-        if m.group(3) and m.group(3) not in roots:
-            raise PolicyError(f"{where}: {spec!r} names undefined root {m.group(3)!r}")
+        if m.group(4) and m.group(4) not in roots:
+            raise PolicyError(f"{where}: {spec!r} names undefined root {m.group(4)!r}")
+        if m.group(5) and not variadic_ok:
+            raise PolicyError(f"{where}: {spec!r}: a '...' slot is only allowed as the LAST "
+                              f"positional argument")
 
 
 def load_policy(path: Optional[Path] = None) -> Policy:
@@ -223,8 +238,8 @@ def load_policy(path: Optional[Path] = None) -> Policy:
         args = r.get("args", []) or []
         if not isinstance(args, list):
             raise PolicyError(f"{where}: 'args' must be a list")
-        for t in args:
-            _check_spec(t, raw_roots, f"{where} args")
+        for i, t in enumerate(args):
+            _check_spec(t, raw_roots, f"{where} args", variadic_ok=(i == len(args) - 1))
         merged = {**DEFAULTS, **{k: v for k, v in r.items() if k in DEFAULTS}}
         if merged["mode"] not in ("always", "elevated"):
             raise PolicyError(f"{where}: mode must be always|elevated")
@@ -235,7 +250,27 @@ def load_policy(path: Optional[Path] = None) -> Policy:
                            hosts=[h.lower() for h in merged["hosts"]],
                            timeout=int(merged["timeout"]), max_output=int(merged["max_output"]),
                            description=str(r.get("description", "")))
-    return Policy(roots=roots, rules=rules, source=str(p))
+    return Policy(roots=roots, rules=rules, source=str(p),
+                  git_identity=_load_git_identity(data.get("git_identity"), p))
+
+
+IDENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()+-]{0,63}$")
+IDENT_EMAIL = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}$")
+
+
+def _load_git_identity(raw, p) -> Optional[Dict[str, str]]:
+    """Validate the optional top-level git_identity. Strict charset: these values become
+    GIT_AUTHOR_*/GIT_COMMITTER_* in the child environment and land in commit objects."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {"name", "email"}:
+        raise PolicyError(f"{p}: 'git_identity' must be {{\"name\": ..., \"email\": ...}}")
+    name, email = raw["name"], raw["email"]
+    if not isinstance(name, str) or not IDENT_NAME.match(name):
+        raise PolicyError(f"{p}: git_identity.name {name!r} is not a plain display name")
+    if not isinstance(email, str) or not IDENT_EMAIL.match(email):
+        raise PolicyError(f"{p}: git_identity.email {email!r} is not a plain address")
+    return {"name": name, "email": email}
 
 
 # --- matching ---------------------------------------------------------------------------------
@@ -285,7 +320,7 @@ def _check_value(spec: str, tok: str, policy: Policy) -> Tuple[bool, str, str]:
         if TYPES[m.group(1)].match(tok):
             return True, "", tok
         return False, f"{tok!r} is not a valid {m.group(1)}", tok
-    root = policy.roots[m.group(3)]
+    root = policy.roots[m.group(4)]
     if not tok or "\x00" in tok:
         return False, "empty or NUL path", tok
     expanded = os.path.expanduser(tok)
@@ -293,9 +328,21 @@ def _check_value(spec: str, tok: str, policy: Policy) -> Tuple[bool, str, str]:
         return False, f"path {tok!r} must be absolute (or ~/...)", tok
     resolved = os.path.realpath(expanded) if root.resolve else os.path.normpath(expanded)
     if _under(resolved, root):
+        if m.group(3) == "file" and os.path.isdir(resolved):
+            # {file:ROOT}: a directory would stand for everything under it (a repo root is
+            # `git add .` by another name). Name files. A path that doesn't exist yet is fine:
+            # staging a deletion or the old side of a rename names a file that is gone.
+            return False, (f"path {tok!r} is a directory; this slot takes files only "
+                           f"(name each file)"), tok
         return True, "", resolved
     shown = f"{tok!r}" + (f" (resolves to {resolved!r})" if resolved != expanded else "")
     return False, f"path {shown} is not under root {root.name!r} ({', '.join(root.patterns)})", tok
+
+
+def _variadic(rule: "Rule") -> bool:
+    """True if the rule's last positional is a repeating ``{path:ROOT...}`` / ``{file:ROOT...}``
+    slot: it takes ONE OR MORE values, each checked on its own."""
+    return bool(rule.args) and rule.args[-1].endswith("...}")
 
 
 def _optional_type(spec: Optional[str]) -> bool:
@@ -367,10 +414,12 @@ def match_rule(rule: Rule, argv: List[str], policy: Policy) -> List[str]:
             out += [opt, run_v]
             i += 2
             continue
-        if pos >= len(rule.args):
+        variadic = _variadic(rule)
+        if pos >= len(rule.args) and not variadic:
             raise NoMatch(i, f"unexpected argument {tok!r} (rule {rule.name!r} takes "
                              f"{len(rule.args)} positional argument(s))")
-        ok, why, run_tok = _check_value(rule.args[pos], tok, policy)
+        spec = rule.args[min(pos, len(rule.args) - 1)]
+        ok, why, run_tok = _check_value(spec, tok, policy)
         if not ok:
             raise NoMatch(i, f"argument {pos + 1}: {why}")
         out.append(run_tok)

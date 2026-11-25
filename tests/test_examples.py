@@ -53,6 +53,19 @@ class TestExecExample(unittest.TestCase):
         self.assertFalse(d.allowed)
         self.assertIn("arma-elevate exec git-push", d.hint)
 
+    def test_git_add_takes_named_files_only(self):
+        repo = str(self.repo)
+        (self.repo / "a.py").write_text("a")
+        (self.repo / "b.py").write_text("b")
+        add = ["git", "-C", repo, "add"]
+        self.assertTrue(decide(add + [repo + "/a.py", repo + "/b.py"], "anyhost",
+                               self.policy, []).allowed)
+        for bad in ([repo], ["."], ["-A"], ["-p", repo + "/a.py"], []):
+            self.assertFalse(decide(add + bad, "anyhost", self.policy, []).allowed, bad)
+
+    def test_example_sets_agent_identity(self):
+        self.assertEqual(self.policy.git_identity["name"], "Cognate (armamentarium)")
+
 
 if __name__ == "__main__":
     unittest.main()

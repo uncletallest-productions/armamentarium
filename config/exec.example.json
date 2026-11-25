@@ -5,9 +5,12 @@
     "Keep it OUTSIDE every root an agent can write (the router refuses a policy that is group/world-writable or not yours).",
     "Anything not matched by a rule is refused. Options not listed in a rule's 'options' are refused. argv never touches a shell.",
     "mode: 'always' runs without approval; 'elevated' needs a live grant: arma-elevate exec <rule> [host] [ttl].",
-    "Placeholders: {int} {name} {word} {unit} {host} {time} {text} {ref} {dataset}; '?' suffix = optional; {path:ROOT} must resolve under a named root.",
+    "Placeholders: {int} {name} {word} {unit} {host} {time} {text} {ref} {dataset}; '?' suffix = optional; {path:ROOT} must resolve under a named root; {file:ROOT} is the same but never a directory.",
+    "A trailing '...' on the LAST positional ({file:ROOT...}) takes one or more values, each checked. git-add uses it: name every file; no -A, no '.', no directory.",
+    "git_identity: the author/committer stamped on every agent git command, so agent commits are distinguishable from yours in every repo.",
     "Edit roots to match your machine. This example assumes code in ~/projects/<owner>/<repo>."
   ],
+  "git_identity": {"name": "Cognate (armamentarium)", "email": "cognate@armamentarium.invalid"},
   "roots": {
     "repos-read": [
       "~/projects/*"
@@ -51,8 +54,9 @@
     },
     "git-add": {
       "mode": "always",
+      "description": "Stage named files only: one or more per call; never a directory, -A or '.'",
       "argv": ["git", "-C", "{path:repos-write}", "add"],
-      "args": ["{path:repos-write}"]
+      "args": ["{file:repos-write...}"]
     },
     "git-commit": {
       "mode": "always",

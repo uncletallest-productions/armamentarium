@@ -91,13 +91,17 @@ armamentarium enforces policy at the **tool boundary**. The rules:
 6. **Things git would execute are switched off.** `.git/` and hook directories are
    unwritable through the router, even with a grant. Every git call also runs with
    fsmonitor off, `hooksPath` pointed at a root-owned directory of hooks you've approved,
-   `protocol.ext` disabled, and no external diff or textconv.
-7. **Refusals teach.** A refusal names the rule that came closest and the token that
+   `protocol.ext` disabled, no external diff or textconv, and `--literal-pathspecs`, so a
+   `*` in an argument is a file name, not a pattern.
+7. **Agent commits say so.** Every git call runs with the author and committer set to an
+   agent identity (`git_identity` in the policy, or a built-in default). In every repo,
+   agent commits are distinguishable from yours, and your own commits keep your own config.
+8. **Refusals teach.** A refusal names the rule that came closest and the token that
    failed. When a grant would help, it gives the exact `arma-elevate` command.
-8. **Everything is logged.** Every decision, allowed or refused, goes to
+9. **Everything is logged.** Every decision, allowed or refused, goes to
    `~/.local/state/armamentarium/exec.log`. Every grant that ends goes to `grants.log`.
    Two logs, two questions: what was *allowed*, and what actually *ran*.
-9. **Shared storage is untrusted.** Anything an agent can write, like a synced config
+10. **Shared storage is untrusted.** Anything an agent can write, like a synced config
    store, is treated as hostile when read back. See [Fleet config](#fleet-config-arma-config).
 
 ### What it is not
@@ -247,7 +251,11 @@ chmod 0644 ~/.config/armamentarium/exec.json
 - **Slots:** `{int}` `{name}` `{word}` `{unit}` `{host}` `{time}` `{text}` `{ref}`
   `{dataset}`. A `?` suffix makes a slot optional. `{path:ROOT}` must resolve (realpath)
   under one of the named root's patterns, and the command runs with the resolved path,
-  not the caller's spelling.
+  not the caller's spelling. `{file:ROOT}` is the same but never a directory (a repo root
+  is `git add .` by another name); a path that no longer exists is allowed, so deletions
+  can be staged.
+- **Repeating slot:** a trailing `...` on the *last* positional (`{file:ROOT...}`) takes
+  one or more values, each checked on its own. One bad value refuses the whole call.
 - **`options`** are the *only* flags allowed after the prefix, each with a value type, or
   `null` for a bare flag. Bundled short flags (`-sb`) aren't expanded: write `-s -b`.
 - **`args`** are the positional arguments after the options.
@@ -412,7 +420,7 @@ cd ~/src/armamentarium
 Run the tests as a **non-root** user. They use real subprocesses in temp directories (git
 repos, unix sockets) and play attacker against the policy, grant, and deploy code: hostile
 argv, symlink and `..` escapes, planted git hooks and fsmonitor, a tampered config store,
-and more. There are about 150 tests, all stdlib `unittest`; no pytest needed.
+and more. There are about 175 tests, all stdlib `unittest`; no pytest needed.
 
 ---
 

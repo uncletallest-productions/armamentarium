@@ -256,6 +256,98 @@ class GitHardeningTests(RunnerBase):
         self.assertFalse(self.marker.exists(), "repo core.hooksPath hook was executed")
 
 
+class GitPathspecAndIdentityTests(RunnerBase):
+    """2026-11-25: explicit-file staging can't be widened by a glob, and agent commits carry the
+    agent identity in every repo, whatever the repo's own user.name says."""
+
+    def setUp(self):
+        super().setUp()
+        self.git("init", "-q")
+        pol = json.loads(self.policy.read_text())
+        pol["rules"]["git-add-files"] = {"mode": "always",
+                                         "argv": ["git", "-C", "{path:git}", "add"],
+                                         "args": ["{file:git...}"]}
+        self.policy.write_text(json.dumps(pol))
+        self.policy.chmod(0o644)
+
+    def staged(self):
+        out = subprocess.run(["git", "-C", str(self.repo), "diff", "--cached", "--name-only"],
+                             capture_output=True, text=True, check=True,
+                             env={**os.environ, "PATH": SAFE_PATH}).stdout
+        return sorted(out.split())
+
+    def test_harden_adds_literal_pathspecs(self):
+        h = harden(["git", "-C", "/r", "add", "/r/x"])
+        self.assertIn("--literal-pathspecs", h)
+        self.assertLess(h.index("--literal-pathspecs"), h.index("add"))
+
+    def test_glob_is_a_name_not_a_pattern(self):
+        for n in ("a.txt", "b.txt"):
+            (self.repo / n).write_text(n)
+        r = self.run_(["git", "-C", str(self.repo), "add", str(self.repo / "*.txt")])
+        self.assertTrue(r.allowed, r.reason)
+        self.assertNotEqual(r.exit_code, 0, "a literal '*.txt' should match no file")
+        self.assertEqual(self.staged(), [], "the glob staged files")
+
+    def test_several_named_files_stage(self):
+        for n in ("a.txt", "b.txt", "c.txt"):
+            (self.repo / n).write_text(n)
+        r = self.run_(["git", "-C", str(self.repo), "add", str(self.repo / "a.txt"),
+                       str(self.repo / "b.txt")])
+        self.assertEqual(r.exit_code, 0, r.stderr)
+        self.assertEqual(self.staged(), ["a.txt", "b.txt"])
+
+    def test_deletion_stages(self):
+        (self.repo / "a.txt").write_text("a")
+        self.git("add", "a.txt")
+        self.git("commit", "-q", "-m", "seed")
+        (self.repo / "a.txt").unlink()
+        r = self.run_(["git", "-C", str(self.repo), "add", str(self.repo / "a.txt")])
+        self.assertEqual(r.exit_code, 0, r.stderr)
+        self.assertEqual(self.staged(), ["a.txt"])
+
+    def commit_and_read_author(self):
+        (self.repo / "f").write_text("x")
+        self.run_(["git", "-C", str(self.repo), "add", str(self.repo / "f")])
+        r = self.run_(["git", "-C", str(self.repo), "commit", "-m", "agent commit"])
+        self.assertEqual(r.exit_code, 0, r.stderr)
+        return subprocess.run(["git", "-C", str(self.repo), "log", "-1",
+                               "--format=%an <%ae>|%cn <%ce>"], capture_output=True, text=True,
+                              check=True, env={**os.environ, "PATH": SAFE_PATH}).stdout.strip()
+
+    def test_agent_identity_beats_repo_user(self):
+        # the Substrate case: a repo-local user.name that would otherwise apply to everyone
+        self.git("config", "user.name", "Operator Person")
+        self.git("config", "user.email", "operator@example.invalid")
+        d = exec_runner.DEFAULT_GIT_IDENTITY
+        want = f"{d['name']} <{d['email']}>"
+        self.assertEqual(self.commit_and_read_author(), f"{want}|{want}")
+
+    def test_operator_commit_keeps_operator_identity(self):
+        # the operator's own git (not through arma_exec) is untouched
+        self.git("config", "user.name", "Operator Person")
+        self.git("config", "user.email", "operator@example.invalid")
+        (self.repo / "g").write_text("y")
+        self.git("add", "g")
+        self.git("commit", "-q", "-m", "operator commit")
+        out = subprocess.run(["git", "-C", str(self.repo), "log", "-1", "--format=%an"],
+                             capture_output=True, text=True, check=True,
+                             env={**os.environ, "PATH": SAFE_PATH}).stdout.strip()
+        self.assertEqual(out, "Operator Person")
+
+    def test_policy_git_identity_override(self):
+        pol = json.loads(self.policy.read_text())
+        pol["git_identity"] = {"name": "Cognate (Scriptor)", "email": "scriptor@example.invalid"}
+        self.policy.write_text(json.dumps(pol))
+        self.policy.chmod(0o644)
+        want = "Cognate (Scriptor) <scriptor@example.invalid>"
+        self.assertEqual(self.commit_and_read_author(), f"{want}|{want}")
+
+    def test_identity_only_for_git(self):
+        r = self.run_(["env"])
+        self.assertNotIn("GIT_AUTHOR_NAME", r.stdout)
+
+
 class ProtectedWriteTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

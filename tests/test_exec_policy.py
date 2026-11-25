@@ -294,5 +294,109 @@ class ValidationTests(Base):
         self.assertFalse(decide(["uptime"], HOST, pol, []).allowed)
 
 
+class FileSlotTests(Base):
+    """{file:ROOT...}: explicit files only, one or more per call (2026-11-25 git-add hardening)."""
+
+    def setUp(self):
+        super().setUp()
+        self.r = self.root / "repos" / "armamentarium"
+        (self.r / "a.py").write_text("a")
+        (self.r / "b.py").write_text("b")
+        (self.r / "sub").mkdir()
+        pol = json.loads((self.root / "exec.json").read_text())
+        pol["rules"]["git-add"] = {"mode": "always", "argv": ["git", "-C", "{path:git}", "add"],
+                                   "args": ["{file:git...}"]}
+        self.policy = self.make(pol)
+
+    def test_one_file(self):
+        d = self.ok(["git", "-C", str(self.r), "add", str(self.r / "a.py")])
+        self.assertEqual(d.run_argv[-1], str(self.r / "a.py"))
+
+    def test_several_files_one_call(self):
+        d = self.ok(["git", "-C", str(self.r), "add", str(self.r / "a.py"),
+                     str(self.r / "b.py")])
+        self.assertEqual(d.run_argv[-2:], [str(self.r / "a.py"), str(self.r / "b.py")])
+
+    def test_repo_root_refused(self):
+        # the absolute spelling of `git add .`
+        self.no(["git", "-C", str(self.r), "add", str(self.r)], contains="directory")
+
+    def test_subdirectory_refused(self):
+        self.no(["git", "-C", str(self.r), "add", str(self.r / "sub")], contains="directory")
+
+    def test_dot_and_relative_refused(self):
+        self.no(["git", "-C", str(self.r), "add", "."], contains="absolute")
+        self.no(["git", "-C", str(self.r), "add", "a.py"], contains="absolute")
+
+    def test_trailing_dot_resolves_to_dir_and_is_refused(self):
+        self.no(["git", "-C", str(self.r), "add", str(self.r) + "/."], contains="directory")
+
+    def test_one_bad_file_refuses_the_whole_call(self):
+        self.no(["git", "-C", str(self.r), "add", str(self.r / "a.py"), str(self.r)],
+                contains="directory")
+
+    def test_deleted_file_allowed(self):
+        # staging a deletion (or the old side of a rename) names a path that no longer exists
+        self.ok(["git", "-C", str(self.r), "add", str(self.r / "gone.py")])
+
+    def test_zero_files_refused(self):
+        self.no(["git", "-C", str(self.r), "add"], contains="missing")
+
+    def test_flags_still_refused(self):
+        self.no(["git", "-C", str(self.r), "add", "-A"], contains="not allowed")
+        self.no(["git", "-C", str(self.r), "add", "-p", str(self.r / "a.py")],
+                contains="not allowed")
+
+    def test_outside_root_refused(self):
+        self.no(["git", "-C", str(self.r), "add", str(self.root / "outside" / "x")],
+                contains="not under root")
+
+    def test_symlinked_dir_escape_refused(self):
+        self.no(["git", "-C", str(self.r), "add", str(self.root / "repos" / "escape")])
+
+
+class FileSlotValidationTests(Base):
+    def base(self):
+        return {"version": 1, "roots": {"git": [str(self.root / "repos" / "*")]}, "rules": {}}
+
+    def test_variadic_must_be_last(self):
+        pol = self.base()
+        pol["rules"]["r"] = {"mode": "always", "argv": ["git", "add"],
+                             "args": ["{file:git...}", "{word?}"]}
+        with self.assertRaises(PolicyError) as cm:
+            self.make(pol)
+        self.assertIn("LAST", str(cm.exception))
+
+    def test_variadic_in_argv_refused(self):
+        pol = self.base()
+        pol["rules"]["r"] = {"mode": "always", "argv": ["git", "-C", "{path:git...}", "add"]}
+        with self.assertRaises(PolicyError):
+            self.make(pol)
+
+    def test_file_slot_undefined_root(self):
+        pol = self.base()
+        pol["rules"]["r"] = {"mode": "always", "argv": ["git", "add"], "args": ["{file:nope}"]}
+        with self.assertRaises(PolicyError) as cm:
+            self.make(pol)
+        self.assertIn("undefined root", str(cm.exception))
+
+    def test_git_identity_valid_and_default(self):
+        pol = self.base()
+        pol["rules"]["r"] = {"mode": "always", "argv": ["uptime"]}
+        self.assertIsNone(self.make(pol).git_identity)
+        pol["git_identity"] = {"name": "Cognate (Scriptor)", "email": "cognate@example.invalid"}
+        self.assertEqual(self.make(pol).git_identity["name"], "Cognate (Scriptor)")
+
+    def test_git_identity_rejects_junk(self):
+        pol = self.base()
+        pol["rules"]["r"] = {"mode": "always", "argv": ["uptime"]}
+        for bad in ({"name": "x"}, {"name": "A\nB", "email": "a@b"},
+                    {"name": "A", "email": "not-an-address"},
+                    {"name": "A", "email": "a@b", "extra": 1}, "Cognate"):
+            pol["git_identity"] = bad
+            with self.assertRaises(PolicyError, msg=repr(bad)):
+                self.make(pol)
+
+
 if __name__ == "__main__":
     unittest.main()

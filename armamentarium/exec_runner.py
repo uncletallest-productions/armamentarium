@@ -10,7 +10,12 @@ the things that make an ALLOWED command safe to actually run:
 * a minimal environment: only what the allowed commands genuinely need is passed through.
 * git hardening: repo-local config can name programs git will run. Writes under .git/ are
   already denied to agents by the router (protected_write_reason); as the second fix, every git
-  call here forces those knobs off. Decided 2026-11-23: both fixes.
+  call here forces those knobs off. Decided 2026-11-23: both fixes. Every git call also gets
+  ``--literal-pathspecs``, so ``*`` or ``:(glob)`` in an argument is a file name, never a pattern.
+* agent identity: every git call runs with GIT_AUTHOR_*/GIT_COMMITTER_* set to the agent
+  identity (policy ``git_identity``, else DEFAULT_GIT_IDENTITY). Agent commits are labelled as
+  agent commits in every repo, and the operator's own commits keep the operator's own config.
+  (2026-11-25: one repo-local user.name had credited the operator's commits to the agent.)
 * sudo rules run as ``sudo -n``: no password prompt, ever. Each command must be allowed by an
   operator-written sudoers entry; there is no blanket sudo.
 * timeout kills the whole process group; output is capped; the decision, allowed or refused, is
@@ -53,7 +58,9 @@ GIT_HARDEN = [
     "-c", "core.sshCommand=ssh -o BatchMode=yes -o ControlMaster=no -o ConnectTimeout=15",
     "-c", "protocol.ext.allow=never",          # ext:: remotes run arbitrary commands
     "--no-pager",
+    "--literal-pathspecs",                     # `*`, `:(glob)`, `:/` are names, not patterns
 ]
+DEFAULT_GIT_IDENTITY = {"name": "Cognate (armamentarium)", "email": "cognate@armamentarium.invalid"}
 GIT_NO_DIFF_PROGRAMS = {"diff", "show", "log"}  # add --no-ext-diff --no-textconv after these
 ARG_LOG_MAX = 200
 
@@ -94,11 +101,16 @@ def harden(argv: List[str]) -> List[str]:
     return out + rest[i + 1:]
 
 
-def _env() -> dict:
+def _env(git_identity: Optional[dict] = None) -> dict:
     env = {k: os.environ[k] for k in PASS_ENV if k in os.environ}
     env.update(session_env.session_env())
     env.update({"PATH": SAFE_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TERM": "dumb",
                 "GIT_TERMINAL_PROMPT": "0", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"})
+    if git_identity:
+        env.update({"GIT_AUTHOR_NAME": git_identity["name"],
+                    "GIT_AUTHOR_EMAIL": git_identity["email"],
+                    "GIT_COMMITTER_NAME": git_identity["name"],
+                    "GIT_COMMITTER_EMAIL": git_identity["email"]})
     return env
 
 
@@ -193,8 +205,9 @@ def execute(argv: List[str], host: Optional[str] = None,
     timed_out = False
     abandoned = False
     try:
+        ident = (policy.git_identity or DEFAULT_GIT_IDENTITY) if argv[0] == "git" else None
         proc = subprocess.Popen(run, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, cwd="/", env=_env(),
+                                stderr=subprocess.PIPE, cwd="/", env=_env(ident),
                                 start_new_session=True)
     except OSError as exc:
         entry.update(error=str(exc))
