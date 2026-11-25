@@ -1,3 +1,4 @@
+<!-- vendored from canon:NAMING.md sha256:1dd0da4b13e7854c3662b9fe4565b0c760d6541f61abd46ee6af1414918df8ea -- edit canon, not this file -->
 # Naming: why everything here sounds like a cathedral library
 
 Uncle Tallest Productions projects name things in Latin, with a deliberate nod to the
@@ -9,8 +10,9 @@ lore.
 The names aren't only decoration, though. **A name tells you what kind of thing it is
 and whose it is** before you read a word of documentation. This page is the key.
 
-> This file is shared by every repo that uses the scheme. Edit it once, in its
-> canonical home, and copy it out. Don't fork it per repo.
+> Every repo that uses the scheme carries a copy of this file, kept identical to one
+> canonical version. Improvements go into the canonical version and are copied out from
+> there, so don't edit a copy in place.
 
 ---
 
